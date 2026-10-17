@@ -150,3 +150,60 @@ def list_events(claim_id: str) -> list[dict[str, Any]]:
             (claim_id,),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def set_claim_status(claim_id: str, status: str) -> None:
+    """Set the queue status for one claim."""
+    with connection() as db:
+        result = db.execute(
+            "UPDATE claims SET status = ? WHERE claim_id = ?", (status, claim_id)
+        )
+    if result.rowcount == 0:
+        raise KeyError(claim_id)
+
+
+def add_event(claim_id: str, step: str, detail: str) -> None:
+    """Persist one claim progress event."""
+    with connection() as db:
+        db.execute(
+            "INSERT INTO events (claim_id, step, detail) VALUES (?, ?, ?)",
+            (claim_id, step, detail),
+        )
+
+
+def save_decision(claim_id: str, decision: dict[str, Any], status: str) -> None:
+    """Persist a decision and its resulting queue status."""
+    with connection() as db:
+        result = db.execute(
+            "UPDATE claims SET decision_json = ?, status = ? "
+            "WHERE claim_id = ? AND decision_json IS NULL",
+            (json.dumps(decision), status, claim_id),
+        )
+    if result.rowcount == 0:
+        raise ValueError("Claim not found or already decided")
+
+
+def sign_off_claim(claim_id: str, handler_id: str) -> None:
+    """Record handler sign-off for a claim awaiting approval."""
+    with connection() as db:
+        result = db.execute(
+            "UPDATE claims SET sign_off_handler_id = ?, status = 'decided' "
+            "WHERE claim_id = ? AND status = 'waiting for sign-off' "
+            "AND sign_off_handler_id IS NULL",
+            (handler_id, claim_id),
+        )
+    if result.rowcount == 0:
+        raise ValueError("Claim is not waiting for sign-off")
+
+
+def save_payment(claim_id: str, amount_inr: float) -> None:
+    """Record a simulated INR payment for one approved claim."""
+    payment = {"amount_inr": amount_inr, "simulated": True}
+    with connection() as db:
+        result = db.execute(
+            "UPDATE claims SET payment_json = ? WHERE claim_id = ? "
+            "AND payment_json IS NULL",
+            (json.dumps(payment), claim_id),
+        )
+    if result.rowcount == 0:
+        raise ValueError("Claim not found or already paid")

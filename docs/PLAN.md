@@ -30,11 +30,11 @@ Keep payment as a separate operation that requires an amount. It may write a sim
 
 Success criteria:
 
-- [ ] `uv run pytest backend/tests/test_decisions.py backend/tests/test_payments.py -q --no-cov` passes for approval, decline, referral, INR rounding, the ₹83,000 boundary, and the ₹83,000.01 sign-off case.
-- [ ] An approved payout of ₹83,000 can be recorded without sign-off; ₹83,000.01 cannot be paid before sign-off.
-- [ ] A blocked payment attempt creates no payment record; after a handler signs off, the matching simulated payment succeeds and is persisted.
-- [ ] The payment operation takes an explicit amount and returns a clear error for a mismatched amount or an unapproved claim.
-- [ ] Tests confirm that source USD values are converted once and that calculation steps and stored payouts are in INR.
+- [x] `uv run pytest backend/tests/test_decisions.py backend/tests/test_payments.py -q --no-cov` passes for approval, decline, referral, INR rounding, the ₹83,000 boundary, and the ₹83,000.01 sign-off case.
+- [x] An approved payout of ₹83,000 can be recorded without sign-off; ₹83,000.01 cannot be paid before sign-off.
+- [x] A blocked payment attempt creates no payment record; after a handler signs off, the matching simulated payment succeeds and is persisted.
+- [x] The payment operation takes an explicit amount and returns a clear error for a mismatched amount or an unapproved claim.
+- [x] Tests confirm that source USD values are converted once and that calculation steps and stored payouts are in INR.
 
 ## Phase 3: Build the UnderCover Agent and its backend tools
 
