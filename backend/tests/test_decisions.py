@@ -79,7 +79,7 @@ def test_baggage_calculation_applies_per_item_cap_and_deductible(client):
 
 
 def test_money_rounding_and_description_quantity():
-    assert to_inr("0.105") == 8.72
+    assert to_inr("0.105", 83) == 8.72
     assert item_quantity("Four shirts") == 4
     assert item_quantity("Camera, one item") == 1
 

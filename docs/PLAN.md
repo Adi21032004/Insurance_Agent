@@ -67,8 +67,8 @@ Exercise the complete workflow with a stub model in automated tests: waiting cla
 
 Success criteria:
 
-- [ ] `uv run pytest -q` passes with at least 80% backend and agent coverage.
-- [ ] `npm run check` passes: Python formatting, lint, types and tests; TypeScript formatting, lint, types and tests; and Playwright end-to-end tests.
-- [ ] Playwright end-to-end coverage verifies a claim can be opened and run with a stub model, that progress and the decision appear, and that an over-threshold payment is blocked until sign-off.
-- [ ] In the Playwright MCP browser, the queue, claim detail and instructions view all load without console errors, and the displayed status updates after a claim is decided.
-- [ ] `GET /api/health` still returns `{"status":"ok"}` and no real payment service is called.
+- [x] `uv run pytest -q` passes with at least 80% backend and agent coverage.
+- [x] `npm run check` passes: Python formatting, lint, types and tests; TypeScript formatting, lint, types and tests; and Playwright end-to-end tests.
+- [x] Playwright end-to-end coverage verifies a claim can be opened and run with a stub model, that progress and the decision appear, and that an over-threshold payment is blocked until sign-off.
+- [x] In the Playwright MCP browser, the queue, claim detail and instructions view all load without console errors, and the displayed status updates after a claim is decided.
+- [x] `GET /api/health` still returns `{"status":"ok"}` and no real payment service is called.

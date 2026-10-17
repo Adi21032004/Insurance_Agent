@@ -47,7 +47,7 @@ def test_run_uses_instructions_api_and_records_decision(monkeypatch, tmp_path):
     with TestClient(app):
         database.set_claim_status("CLM-1001", "in progress")
     monkeypatch.setattr(main, "backend", lambda: TestClient(app))
-    monkeypatch.setattr(main, "model", lambda: stub_model("CLM-1001"))
+    monkeypatch.setattr(main, "model", lambda claim_id=None: stub_model("CLM-1001"))
 
     reply = main.run("CLM-1001", "thread-1")
 
@@ -98,7 +98,9 @@ def test_agent_records_decline_with_policy_evidence(monkeypatch, tmp_path):
             AIMessage(content="Declined under Section 9: General Exclusions."),
         ]
     )
-    monkeypatch.setattr(main, "model", lambda: StubModel(messages=messages))
+    monkeypatch.setattr(
+        main, "model", lambda claim_id=None: StubModel(messages=messages)
+    )
 
     reply = main.run("CLM-1001", "thread-2")
 
@@ -114,7 +116,9 @@ def test_agent_refers_when_policy_evidence_is_incomplete(monkeypatch, tmp_path):
     with TestClient(app):
         database.set_claim_status("CLM-1002", "in progress")
     monkeypatch.setattr(main, "backend", lambda: TestClient(app))
-    monkeypatch.setattr(main, "model", lambda: stub_refer_model("CLM-1002"))
+    monkeypatch.setattr(
+        main, "model", lambda claim_id=None: stub_refer_model("CLM-1002")
+    )
 
     reply = main.run("CLM-1002", "thread-4")
 
@@ -130,7 +134,9 @@ def test_agent_payment_tool_cannot_bypass_handler_signoff(monkeypatch, tmp_path)
     with TestClient(app):
         database.set_claim_status("CLM-1003", "in progress")
     monkeypatch.setattr(main, "backend", lambda: TestClient(app))
-    monkeypatch.setattr(main, "model", lambda: stub_over_limit_model("CLM-1003"))
+    monkeypatch.setattr(
+        main, "model", lambda claim_id=None: stub_over_limit_model("CLM-1003")
+    )
 
     reply = main.run("CLM-1003", "thread-3")
 

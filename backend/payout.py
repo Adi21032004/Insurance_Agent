@@ -1,6 +1,7 @@
 """Policy limit and deductible calculations in Indian rupees."""
 
 import re
+from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
@@ -28,6 +29,15 @@ QUANTITY_WORDS = {
     "nine": 9,
     "ten": 10,
 }
+
+
+@dataclass(frozen=True)
+class PayoutCoverage:
+    """Policy context needed to calculate selected claim items."""
+
+    plan: dict[str, Any]
+    add_ons: list[str]
+    rate: int | float | str
 
 
 def currency(amount: float) -> Decimal:
@@ -69,13 +79,14 @@ def item_limit(
     source_item: dict[str, Any],
     plan: dict[str, Any],
     add_ons: list[str],
+    rate: int | float | str,
 ) -> Decimal | None:
     """Return the applicable per-item limit for a selected claim item."""
     if benefit != "baggage" or source_item["category"] == "cash":
         return None
     per_item_limit = plan["per_item_limit_inr"]
     if source_item["category"] == "electronics" and "electronics_plus" in add_ons:
-        plan_data = converted_plans(database.get_setting("plans"))
+        plan_data = converted_plans(database.get_setting("plans"), rate)
         per_item_limit = next(
             row["electronics_per_item_limit_inr"]
             for row in plan_data["add_ons"]
@@ -88,8 +99,7 @@ def selected_items(
     benefit: str,
     claim_items: list[dict[str, Any]],
     selections: list[dict[str, Any]],
-    plan: dict[str, Any],
-    add_ons: list[str],
+    coverage: PayoutCoverage,
 ) -> tuple[list[dict[str, Any]], Decimal, Decimal]:
     """Calculate selected line values and collect any claimed cash."""
     validate_selection(claim_items, selections)
@@ -98,11 +108,13 @@ def selected_items(
     cash_total = Decimal("0.00")
     for selection in selections:
         source_item = claim_items[selection["item_index"]]
-        amount = currency(to_inr(source_item["amount"]))
+        amount = currency(to_inr(source_item["amount"], coverage.rate))
         if benefit == "baggage" and source_item["category"] == "cash":
             cash_total += amount
             continue
-        limit = item_limit(benefit, source_item, plan, add_ons)
+        limit = item_limit(
+            benefit, source_item, coverage.plan, coverage.add_ons, coverage.rate
+        )
         eligible = min(amount, limit) if limit is not None else amount
         description = source_item["description"]
         if eligible < amount:
@@ -113,11 +125,14 @@ def selected_items(
 
 
 def add_cash(
-    calculation: list[dict[str, Any]], total: Decimal, cash_total: Decimal
+    calculation: list[dict[str, Any]],
+    total: Decimal,
+    cash_total: Decimal,
+    rate: int | float | str,
 ) -> Decimal:
     """Apply the wording's combined cash limit to selected items."""
     if cash_total:
-        eligible_cash = min(cash_total, currency(to_inr(100)))
+        eligible_cash = min(cash_total, currency(to_inr(100, rate)))
         calculation.append(
             amount_step("Cash, subject to the policy limit", eligible_cash)
         )
@@ -154,12 +169,12 @@ def subtract_deductible(
 
 
 def benefit_limit(
-    benefit: str, plan: dict[str, Any], record: dict[str, Any]
+    benefit: str, plan: dict[str, Any], record: dict[str, Any], rate: int | float | str
 ) -> Decimal:
     """Return the plan maximum, also capped by trip cost where required."""
     maximum = currency(plan[BENEFIT_MAXIMUM[benefit]])
     if benefit in {"trip_cancellation", "trip_interruption"}:
-        trip_cost = currency(to_inr(record["policy"]["trip"]["trip_cost"]))
+        trip_cost = currency(to_inr(record["policy"]["trip"]["trip_cost"], rate))
         maximum = min(maximum, trip_cost)
     return maximum
 
@@ -192,25 +207,24 @@ def calculate(
         raise KeyError("Claim not found")
     if benefit != record["claim"]["claim_type"]:
         raise ValueError("Benefit must match the claim type")
-    plan_data = converted_plans(database.get_setting("plans"))
+    company_settings = database.get_setting("company")
+    rate = company_settings["usd_to_inr_rate"]
+    plan_data = converted_plans(database.get_setting("plans"), rate)
     plan = next(
         row for row in plan_data["plans"] if row["plan"] == record["policy"]["plan"]
     )
+    coverage = PayoutCoverage(plan, record["policy"]["add_ons"], rate)
     calculation, total, cash_total = selected_items(
-        benefit,
-        record["claim"]["items"],
-        items,
-        plan,
-        record["policy"]["add_ons"],
+        benefit, record["claim"]["items"], items, coverage
     )
-    total = add_cash(calculation, total, cash_total)
+    total = add_cash(calculation, total, cash_total, rate)
     total = subtract_other_payments(calculation, total, paid_by_others_inr)
     total = subtract_deductible(calculation, total, benefit, plan)
     total = apply_benefit_limit(
-        calculation, total, benefit_limit(benefit, plan, record)
+        calculation, total, benefit_limit(benefit, plan, record, rate)
     )
     payout = float(total.quantize(CENT, rounding=ROUND_HALF_UP))
-    approval_limit = to_inr(database.get_setting("company")["payout_approval_limit"])
+    approval_limit = to_inr(company_settings["payout_approval_limit"], rate)
     return {
         "calculation": calculation,
         "payout_inr": payout,

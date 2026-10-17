@@ -40,22 +40,26 @@ app = FastAPI(title="UnderCover", lifespan=lifespan)
 
 def claim_payload(record: dict[str, Any]) -> dict[str, Any]:
     """Build the INR claim context shown to handlers and the agent."""
-    plan_data = converted_plans(database.get_setting("plans"))
+    company_settings = database.get_setting("company")
+    rate = company_settings["usd_to_inr_rate"]
+    plan_data = converted_plans(database.get_setting("plans"), rate)
     plan = next(
         row for row in plan_data["plans"] if row["plan"] == record["policy"]["plan"]
     )
-    policy = converted_policy(record["policy"])
-    claim = converted_claim(record["claim"])
-    company = converted_company(database.get_setting("company"))
+    policy = converted_policy(record["policy"], rate)
+    claim = converted_claim(record["claim"], rate)
+    company = converted_company(company_settings)
     return {
         "claim": claim,
         "policy": policy,
-        "customer": converted_customer(record["customer"]),
+        "customer": converted_customer(record["customer"], rate),
         "plan": plan,
         "add_ons": plan_data["add_ons"],
         "company": company,
         "handlers": database.get_setting("handlers"),
-        "policy_wording": converted_strings(database.get_setting("policy_wording")),
+        "policy_wording": converted_strings(
+            database.get_setting("policy_wording"), rate
+        ),
         "status": record["status"],
         "decision": record["decision"],
         "sign_off_handler_id": record["sign_off_handler_id"],
@@ -127,9 +131,10 @@ def health() -> dict[str, str]:
 @app.get("/api/claims", operation_id="list_claims")
 def list_claims() -> dict[str, Any]:
     """List claims in the handler queue."""
+    rate = database.get_setting("company")["usd_to_inr_rate"]
     claims = []
     for record in database.list_claim_records():
-        claim = converted_claim(record["claim"])
+        claim = converted_claim(record["claim"], rate)
         claims.append(
             {
                 "claim_id": claim["claim_id"],
@@ -164,7 +169,12 @@ def get_instructions() -> dict[str, str]:
 @app.get("/api/policy-wording", operation_id="get_policy_wording")
 def get_policy_wording() -> dict[str, str]:
     """Return the policy wording with all currency amounts in INR."""
-    return {"policy_wording": converted_strings(database.get_setting("policy_wording"))}
+    rate = database.get_setting("company")["usd_to_inr_rate"]
+    return {
+        "policy_wording": converted_strings(
+            database.get_setting("policy_wording"), rate
+        )
+    }
 
 
 @app.post("/api/claims/{claim_id}/run", operation_id="start_claim")
@@ -252,7 +262,10 @@ def pay_claim(claim_id: str, request: PaymentInput) -> dict[str, Any]:
         raise HTTPException(
             status_code=409, detail="Payment amount must match the approved payout"
         )
-    approval_limit = to_inr(database.get_setting("company")["payout_approval_limit"])
+    company_settings = database.get_setting("company")
+    approval_limit = to_inr(
+        company_settings["payout_approval_limit"], company_settings["usd_to_inr_rate"]
+    )
     needs_sign_off = decision["payout_inr"] > approval_limit
     if needs_sign_off and record["sign_off_handler_id"] is None:
         raise HTTPException(

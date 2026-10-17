@@ -12,7 +12,7 @@ from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field, SecretStr
 
-from agent.testing import stub_model
+from agent.testing import stub_model, stub_over_limit_model
 
 load_dotenv()
 
@@ -126,10 +126,13 @@ def pay_claim(claim_id: str, amount_inr: float) -> str:
     return json.dumps(response.json())
 
 
-def model() -> BaseChatModel:
+def model(claim_id: str | None = None) -> BaseChatModel:
     """Return the configured test model or the OpenRouter model."""
     if os.getenv("UNDERCOVER_AGENT_TEST_MODE") == "1":
-        return stub_model(os.getenv("UNDERCOVER_TEST_CLAIM_ID", "CLM-1001"))
+        test_claim_id = claim_id or os.getenv("UNDERCOVER_TEST_CLAIM_ID", "CLM-1001")
+        if test_claim_id == "CLM-1003":
+            return stub_over_limit_model(test_claim_id)
+        return stub_model(test_claim_id)
     name = os.getenv("MODEL_NAME")
     return ChatOpenAI(
         model=name or DEFAULT_MODEL,
@@ -153,7 +156,7 @@ def run(claim_id: str, thread_id: str) -> str:
         pay_claim,
     ]
     agent = create_agent(
-        model(), tools=tools, system_prompt=response.json()["instructions"]
+        model(claim_id), tools=tools, system_prompt=response.json()["instructions"]
     )
     result = agent.invoke(
         {"messages": [{"role": "user", "content": f"Review claim {claim_id}."}]},
