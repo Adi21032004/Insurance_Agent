@@ -2,10 +2,12 @@
 
 from contextlib import asynccontextmanager
 from typing import Any
+from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 
 from agent.instructions import SYSTEM_PROMPT
+from agent.main import run as run_agent
 from backend import database
 from backend.money import (
     converted_claim,
@@ -76,6 +78,31 @@ def require_in_progress(record: dict[str, Any]) -> None:
         raise HTTPException(status_code=409, detail="Claim is not in progress")
 
 
+def process_claim(claim_id: str, thread_id: str) -> None:
+    """Run one claim and return incomplete work to the queue."""
+    try:
+        run_agent(claim_id, thread_id)
+    except Exception:
+        record = database.get_claim_record(claim_id)
+        if record is not None and record["decision"] is None:
+            database.set_claim_status(claim_id, "waiting")
+            database.add_event(
+                claim_id,
+                "Review paused",
+                "The agent could not finish. The claim returned to the waiting queue.",
+            )
+        return
+    record = database.get_claim_record(claim_id)
+    if record is not None and record["decision"] is None:
+        database.set_claim_status(claim_id, "waiting")
+        database.add_event(
+            claim_id,
+            "Review paused",
+            "The agent did not record a decision. "
+            "The claim returned to the waiting queue.",
+        )
+
+
 def calculate_or_422(claim_id: str, request: PayoutInput) -> dict[str, Any]:
     """Return a payout calculation or a clear input error."""
     try:
@@ -138,6 +165,20 @@ def get_instructions() -> dict[str, str]:
 def get_policy_wording() -> dict[str, str]:
     """Return the policy wording with all currency amounts in INR."""
     return {"policy_wording": converted_strings(database.get_setting("policy_wording"))}
+
+
+@app.post("/api/claims/{claim_id}/run", operation_id="start_claim")
+def start_claim(claim_id: str, background_tasks: BackgroundTasks) -> dict[str, str]:
+    """Start the agent review for a waiting claim."""
+    record = claim_or_404(claim_id)
+    if record["status"] != "waiting":
+        raise HTTPException(status_code=409, detail="Claim is not waiting")
+    database.set_claim_status(claim_id, "in progress")
+    database.add_event(
+        claim_id, "Review started", "The agent began reviewing the claim."
+    )
+    background_tasks.add_task(process_claim, claim_id, f"{claim_id}-{uuid4()}")
+    return {"status": "in progress"}
 
 
 @app.post("/api/claims/{claim_id}/progress", operation_id="record_claim_progress")

@@ -44,11 +44,11 @@ The agent must return approve, decline or refer; cite the relevant policy sectio
 
 Success criteria:
 
-- [ ] `uv run pytest agent/tests/test_agent.py backend/tests/test_agent_api.py -q --no-cov` passes with a stub model for approve, decline and refer outcomes.
-- [ ] The agent's backend tools use HTTP APIs only; tests fail if the agent attempts to open seed data directly.
-- [ ] A claim run records ordered progress events, a decision with a policy section, and the backend-calculated INR payout.
-- [ ] An over-threshold approval ends in `waiting for sign-off`; an agent payment attempt is rejected until a handler signs off.
-- [ ] The instruction text returned by the instructions API is exactly the system prompt used by the agent.
+- [x] `uv run pytest agent/tests/test_agent.py backend/tests/test_agent_api.py -q --no-cov` passes with a stub model for approve, decline and refer outcomes.
+- [x] The agent's backend tools use HTTP APIs only; tests fail if the agent attempts to open seed data directly.
+- [x] A claim run records ordered progress events, a decision with a policy section, and the backend-calculated INR payout.
+- [x] An over-threshold approval ends in `waiting for sign-off`; an agent payment attempt is rejected until a handler signs off.
+- [x] The instruction text returned by the instructions API is exactly the system prompt used by the agent.
 
 ## Phase 4: Build the claims dashboard
 
