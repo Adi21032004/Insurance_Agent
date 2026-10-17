@@ -56,10 +56,10 @@ Replace the health page with a handler workspace: a queue with clear status labe
 
 Success criteria:
 
-- [ ] `npm run check:ts` passes, including dashboard unit tests and strict TypeScript checks.
-- [ ] Dashboard tests cover queue loading, each status, a claim detail with supporting documents and history, progress updates, decision display, read-only instructions, sign-off and payment controls, and API failure states.
-- [ ] In the Playwright MCP browser at `http://localhost:5173`, the queue is readable, selecting a claim shows its full details and decision area, progress events are visible, and the instructions view cannot be edited.
-- [ ] The page displays INR amounts and uses the specified UnderCover colors without one-edge panel borders or heavy gradients.
+- [x] `npm run check:ts` passes, including dashboard unit tests and strict TypeScript checks.
+- [x] Dashboard tests cover queue loading, each status, a claim detail with supporting documents and history, progress updates, decision display, read-only instructions, sign-off and payment controls, and API failure states.
+- [x] In the Playwright MCP browser at `http://localhost:5173`, the queue is readable, selecting a claim shows its full details and decision area, progress events are visible, and the instructions view cannot be edited.
+- [x] The page displays INR amounts and uses the specified UnderCover colors without one-edge panel borders or heavy gradients.
 
 ## Phase 5: Integrate and check the pilot
 
