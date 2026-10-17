@@ -1,10 +1,12 @@
 # Status
 
-A hello-world skeleton with every check in place:
+The pilot is in progress. Phase 1 is complete.
 
-- `backend/`: one route, `GET /api/health`
-- `agent/`: the entry point `run(claim_id, thread_id)`, with one tool that calls the health route
-- `dashboard/`: one page that shows whether the backend is up
-- `e2e/`: one test of that page
+- `backend/`: SQLite seeds the 25 queue claims from the approved business data files; read APIs return the queue and full claim context in INR, along with the read-only agent instructions and converted policy wording.
+- `agent/`: shared instructions are defined; the existing health-check agent entry point is still in place.
+- `dashboard/`: still shows backend health only.
+- `e2e/`: still checks the health page only.
 
-Nothing of UnderCover is built yet. Update this file as you build.
+The seed records retain their original USD values in SQLite. The API uses the fixed pilot rate of ₹83.00 per USD. No evaluation or security claim data is loaded.
+
+Install with `uv sync` and `npm install`, then run the app with `npm run dev`.
