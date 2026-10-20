@@ -26,6 +26,23 @@ def test_initialize_database_does_not_duplicate_queue(monkeypatch, tmp_path):
     assert len(database.list_claim_records()) == 25
 
 
+def test_initialize_database_restores_missing_company_defaults(monkeypatch, tmp_path):
+    monkeypatch.setattr(database, "DATABASE_PATH", tmp_path / "claims.sqlite3")
+
+    database.initialize_database()
+    company = database.get_setting("company")
+    del company["usd_to_inr_rate"]
+    with database.connection() as db:
+        db.execute(
+            "UPDATE settings SET value = ? WHERE name = 'company'",
+            (json.dumps(company),),
+        )
+
+    database.initialize_database()
+
+    assert database.get_setting("company")["usd_to_inr_rate"] == 83.0
+
+
 def test_database_seed_sources_are_explicit():
     source = (database.ROOT / "backend" / "database.py").read_text(encoding="utf-8")
     assert 'read_json("claims.json")' in source

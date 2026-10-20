@@ -74,31 +74,46 @@ def initialize_database() -> None:
             """
         )
         count = db.execute("SELECT COUNT(*) FROM claims").fetchone()[0]
-        if count:
-            return
-        for claim in claims:
-            policy = policies[claim["policy_id"]]
-            customer = customers[claim["customer_id"]]
-            db.execute(
-                """
-                INSERT INTO claims (
-                    claim_id, policy_id, customer_id, source_json,
-                    policy_json, customer_json
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    claim["claim_id"],
-                    claim["policy_id"],
-                    claim["customer_id"],
-                    json.dumps(claim),
-                    json.dumps(policy),
-                    json.dumps(customer),
-                ),
-            )
-        db.executemany(
-            "INSERT INTO settings (name, value) VALUES (?, ?)",
-            [(name, json.dumps(value)) for name, value in settings.items()],
-        )
+        if not count:
+            for claim in claims:
+                policy = policies[claim["policy_id"]]
+                customer = customers[claim["customer_id"]]
+                db.execute(
+                    """
+                    INSERT INTO claims (
+                        claim_id, policy_id, customer_id, source_json,
+                        policy_json, customer_json
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        claim["claim_id"],
+                        claim["policy_id"],
+                        claim["customer_id"],
+                        json.dumps(claim),
+                        json.dumps(policy),
+                        json.dumps(customer),
+                    ),
+                )
+
+        for name, defaults in settings.items():
+            row = db.execute(
+                "SELECT value FROM settings WHERE name = ?", (name,)
+            ).fetchone()
+            if row is None:
+                db.execute(
+                    "INSERT INTO settings (name, value) VALUES (?, ?)",
+                    (name, json.dumps(defaults)),
+                )
+                continue
+
+            existing = json.loads(row["value"])
+            if isinstance(defaults, dict) and isinstance(existing, dict):
+                merged = {**defaults, **existing}
+                if merged != existing:
+                    db.execute(
+                        "UPDATE settings SET value = ? WHERE name = ?",
+                        (json.dumps(merged), name),
+                    )
 
 
 def list_claim_records() -> list[dict[str, Any]]:

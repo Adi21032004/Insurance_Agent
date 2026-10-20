@@ -13,6 +13,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field, SecretStr
 
 from agent.testing import stub_model, stub_over_limit_model
+from backend.schemas import ItemSelection
 
 load_dotenv()
 
@@ -38,7 +39,7 @@ class DecisionToolInput(BaseModel):
         "passport",
         "emergency_medical",
     ]
-    items: list[dict[str, int]]
+    items: list[ItemSelection]
     paid_by_others_inr: float = Field(ge=0)
 
 
@@ -81,7 +82,7 @@ def record_claim_progress(claim_id: str, step: str, detail: str) -> str:
 def calculate_claim_payout(
     claim_id: str,
     benefit: str,
-    items: list[dict[str, int]],
+    items: list[ItemSelection],
     paid_by_others_inr: float,
 ) -> str:
     """Calculate an INR payout using the policy limits in the backend."""
@@ -90,7 +91,7 @@ def calculate_claim_payout(
             f"/api/agent/claims/{claim_id}/payout",
             json={
                 "benefit": benefit,
-                "items": items,
+                "items": [item.model_dump() for item in items],
                 "paid_by_others_inr": paid_by_others_inr,
             },
         )
