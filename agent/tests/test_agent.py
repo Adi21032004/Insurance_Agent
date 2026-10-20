@@ -14,7 +14,8 @@ from agent.testing import (
     stub_refer_model,
     tool_message,
 )
-from backend import database, main as backend_main
+from backend import database
+from backend import main as backend_main
 from backend.main import app
 
 
@@ -120,13 +121,7 @@ def test_queue_run_plans_order_and_uses_fresh_claim_helpers(monkeypatch, tmp_pat
 
     monkeypatch.setattr(main, "run_claim_helper", tracked_helper)
     monkeypatch.setattr(main, "create_agent", tracked_factory)
-    monkeypatch.setattr(
-        main,
-        "queue_model",
-        lambda candidate_ids, max_claims, queue_run_id: stub_queue_model(
-            candidate_ids, max_claims, queue_run_id
-        ),
-    )
+    monkeypatch.setattr(main, "queue_model", stub_queue_model)
 
     def claim_model(claim_id=None):
         assert claim_id is not None
@@ -162,6 +157,219 @@ def test_queue_run_plans_order_and_uses_fresh_claim_helpers(monkeypatch, tmp_pat
             "claims_manual",
             "policy_wording",
         }
+
+
+def test_queue_retries_one_failed_claim_without_spending_another_slot(
+    monkeypatch, tmp_path
+):
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(main, "backend", lambda: TestClient(app))
+    monkeypatch.setattr(backend_main, "process_queue_run", lambda run_id: None)
+    with TestClient(app) as client:
+        run_id = client.post("/api/agent/runs", json={"max_claims": 5}).json()["run_id"]
+        waiting_before = [
+            claim["claim_id"]
+            for claim in client.get("/api/claims").json()["claims"]
+            if claim["status"] == "waiting"
+        ]
+    first_claim = list(reversed(waiting_before[:5]))[0]
+    calls = []
+    original_helper = main.run_claim_helper
+    monkeypatch.setattr(main, "queue_model", stub_queue_model)
+
+    def claim_model(claim_id=None):
+        record = database.get_claim_record(claim_id)
+        assert record is not None
+        return stub_refer_model(claim_id, record["claim"]["claim_type"])
+
+    def fail_once(claim_id, thread_id):
+        calls.append((claim_id, thread_id))
+        if claim_id == first_claim and thread_id.endswith("attempt1"):
+            raise TimeoutError("Stubbed claim timeout")
+        return original_helper(claim_id, thread_id)
+
+    monkeypatch.setattr(main, "model", claim_model)
+    monkeypatch.setattr(main, "run_claim_helper", fail_once)
+
+    summary = main.run_queue(run_id, f"{run_id}-queue")
+    run = database.get_run(run_id)
+    claim = database.get_claim_record(first_claim)
+    queue = {item["claim"]["claim_id"]: item for item in database.list_claim_records()}
+
+    assert run is not None
+    assert run["status"] == "completed"
+    assert run["summary"] == summary
+    assert len(run["todos"]) == 5
+    retried_todo = next(
+        todo for todo in run["todos"] if todo["claim_id"] == first_claim
+    )
+    assert retried_todo["status"] == "done"
+    assert retried_todo["attempt_count"] == 2
+    assert claim is not None
+    assert claim["failure_count"] == 0
+    assert claim["status"] == "decided"
+    assert [thread for item, thread in calls if item == first_claim] == [
+        f"{run_id}-queue-{first_claim}-attempt1",
+        f"{run_id}-queue-{first_claim}-attempt2",
+    ]
+    assert sum(item["status"] == "waiting" for item in queue.values()) == 20
+    assert "5 referred" in summary
+
+
+def test_second_failure_routes_one_claim_to_handler_and_continues(
+    monkeypatch, tmp_path
+):
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(main, "backend", lambda: TestClient(app))
+    monkeypatch.setattr(backend_main, "process_queue_run", lambda run_id: None)
+    with TestClient(app) as client:
+        run_id = client.post("/api/agent/runs", json={"max_claims": 5}).json()["run_id"]
+        waiting_before = [
+            claim["claim_id"]
+            for claim in client.get("/api/claims").json()["claims"]
+            if claim["status"] == "waiting"
+        ]
+    selected = list(reversed(waiting_before[:5]))
+    original_helper = main.run_claim_helper
+    failures = []
+    monkeypatch.setattr(main, "queue_model", stub_queue_model)
+
+    def claim_model(claim_id=None):
+        record = database.get_claim_record(claim_id)
+        assert record is not None
+        return stub_refer_model(claim_id, record["claim"]["claim_type"])
+
+    def always_fail_first(claim_id, thread_id):
+        if claim_id == selected[0]:
+            failures.append(thread_id)
+            raise RuntimeError("Stubbed tool failure")
+        return original_helper(claim_id, thread_id)
+
+    monkeypatch.setattr(main, "model", claim_model)
+    monkeypatch.setattr(main, "run_claim_helper", always_fail_first)
+
+    summary = main.run_queue(run_id, f"{run_id}-queue")
+    run = database.get_run(run_id)
+    failed_claim = database.get_claim_record(selected[0])
+    decisions = [database.get_claim_record(claim_id) for claim_id in selected[1:]]
+
+    assert run is not None
+    assert run["status"] == "completed"
+    assert run["todos"][0]["status"] == "left for handler"
+    assert failed_claim is not None
+    assert failed_claim["status"] == "needs handler"
+    assert failed_claim["failure_count"] == 2
+    assert len(failures) == 2
+    assert failures[0].endswith("attempt1")
+    assert failures[1].endswith("attempt2")
+    assert all(
+        claim is not None and claim["decision"] is not None for claim in decisions
+    )
+    assert "1 need handler attention" in summary
+
+
+def test_saved_decision_resumes_payment_without_creating_a_second_decision(
+    monkeypatch, tmp_path
+):
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(main, "backend", lambda: TestClient(app))
+    monkeypatch.setattr(backend_main, "process_queue_run", lambda run_id: None)
+    with TestClient(app) as client:
+        run_id = client.post("/api/agent/runs", json={"max_claims": 1}).json()["run_id"]
+    monkeypatch.setattr(main, "queue_model", stub_queue_model)
+    saved_once = []
+
+    def save_then_timeout(claim_id, thread_id):
+        if thread_id.endswith("attempt1"):
+            decision = {
+                "outcome": "approve",
+                "reason": "The saved approval is ready for its simulated payment.",
+                "policy_section": "Section 3: Trip Delay",
+                "calculation": [{"step": "Eligible expenses", "amount_inr": 100.0}],
+                "payout_inr": 100.0,
+                "needs_sign_off": False,
+            }
+            database.save_decision(claim_id, decision, "decided")
+            saved_once.append(claim_id)
+            raise TimeoutError("Stubbed timeout after decision storage")
+        return original_helper(claim_id, thread_id)
+
+    original_helper = main.run_claim_helper
+    monkeypatch.setattr(main, "run_claim_helper", save_then_timeout)
+
+    main.run_queue(run_id, f"{run_id}-queue")
+    claim = database.get_claim_record("CLM-1001")
+    with database.connection() as db:
+        decisions = db.execute(
+            "SELECT COUNT(*) FROM decisions WHERE claim_id = 'CLM-1001'"
+        ).fetchone()[0]
+        payments = db.execute(
+            "SELECT COUNT(*) FROM payments WHERE claim_id = 'CLM-1001'"
+        ).fetchone()[0]
+
+    assert saved_once == ["CLM-1001"]
+    assert claim is not None
+    assert claim["decision"]["outcome"] == "approve"
+    assert claim["payment"] == {"amount_inr": 100.0, "simulated": True}
+    assert decisions == 1
+    assert payments == 1
+
+
+def test_two_failures_resuming_saved_payment_keep_decision_for_handler(
+    monkeypatch, tmp_path
+):
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(main, "backend", lambda: TestClient(app))
+    monkeypatch.setattr(backend_main, "process_queue_run", lambda run_id: None)
+    with TestClient(app) as client:
+        run_id = client.post("/api/agent/runs", json={"max_claims": 1}).json()["run_id"]
+    monkeypatch.setattr(main, "queue_model", stub_queue_model)
+    saved_decision = {
+        "outcome": "approve",
+        "reason": "The evidence supports this approval.",
+        "policy_section": "Section 3: Trip Delay",
+        "calculation": [],
+        "payout_inr": 100.0,
+        "needs_sign_off": False,
+    }
+    original_helper = main.run_claim_helper
+    failed_payments = []
+
+    def failed_payment_tool(*args, **kwargs):
+        failed_payments.append(True)
+        raise RuntimeError("Stubbed payment tool failure")
+
+    def fail_after_decision(claim_id, thread_id):
+        if thread_id.endswith("attempt1"):
+            database.save_decision(claim_id, saved_decision, "decided")
+            raise TimeoutError("Stubbed failure after decision")
+        return original_helper(claim_id, thread_id)
+
+    monkeypatch.setattr(main.pay_claim, "func", failed_payment_tool)
+    monkeypatch.setattr(main, "run_claim_helper", fail_after_decision)
+
+    summary = main.run_queue(run_id, f"{run_id}-queue")
+    run = database.get_run(run_id)
+    claim = database.get_claim_record("CLM-1001")
+    with database.connection() as db:
+        decisions = db.execute(
+            "SELECT COUNT(*) FROM decisions WHERE claim_id = 'CLM-1001'"
+        ).fetchone()[0]
+        payments = db.execute(
+            "SELECT COUNT(*) FROM payments WHERE claim_id = 'CLM-1001'"
+        ).fetchone()[0]
+
+    assert run is not None
+    assert run["status"] == "completed"
+    assert run["todos"][0]["status"] == "left for handler"
+    assert claim is not None
+    assert claim["status"] == "needs handler"
+    assert claim["decision"] == saved_decision
+    assert claim["failure_count"] == 2
+    assert len(failed_payments) == 1
+    assert decisions == 1
+    assert payments == 0
+    assert "1 need handler attention" in summary
 
 
 def test_agent_records_decline_with_policy_evidence(monkeypatch, tmp_path):
@@ -291,6 +499,7 @@ def test_model_respects_model_name_and_defaults(monkeypatch):
     assert isinstance(default_model, ChatOpenAI)
     assert default_model.model_name == "deepseek/deepseek-v4.1-flash"
     assert default_model.reasoning_effort == "low"
+    assert default_model.request_timeout == main.CLAIM_TIMEOUT_SECONDS
     monkeypatch.setenv("MODEL_NAME", "openrouter/free")
     configured_model = main.model()
     assert isinstance(configured_model, ChatOpenAI)

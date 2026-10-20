@@ -87,6 +87,18 @@ class RunCompleteInput(BaseModel):
     summary: str = Field(min_length=1)
 
 
+class RunAttemptFailureInput(BaseModel):
+    """One failed attempt and its short diagnostic detail."""
+
+    detail: str = Field(min_length=1)
+
+
+class RunRetryInput(BaseModel):
+    """Reason for retrying one claim within its active run."""
+
+    reason: str = Field(min_length=1)
+
+
 class RunTodoStatusInput(BaseModel):
     """Allowed state for one queue run work item."""
 

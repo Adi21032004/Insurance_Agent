@@ -92,16 +92,16 @@ Handle claim-level timeouts, provider errors and failed steps without stopping t
 
 Success criteria:
 
-- [ ] `uv run pytest agent/tests/test_agent.py backend/tests/test_runs.py backend/tests/test_agent_api.py -q --no-cov` passes with stubbed timeouts, provider errors and tool failures.
-- [ ] A first failure before any decision returns the claim to `waiting`, records the failure, and the run retries the same claim. A successful retry finishes it without using another cap slot.
-- [ ] A second failure before any decision marks the claim `needs handler` and its to-do item `left for handler`, and later selected claims still complete.
-- [ ] A failure injected after the decision is saved never creates a second decision and never sets the claim to `waiting`. The run resumes sign-off or payment, and two failures there give `needs handler` with the decision intact.
-- [ ] Replaying decision, sign-off or payment steps, including after a partial failure, creates no duplicate decision or payment.
-- [ ] A simulated process crash mid-claim leaves expired leases. Recovery marks the run `interrupted` and resolves each stuck claim by its persisted state, with none left `in progress`.
-- [ ] Final reconciliation retries any selected claim left `waiting` and does not finish the run while one is missed. A run where the agent selected fewer than `min(cap, waiting)` is rejected or corrected.
-- [ ] A `needs handler` claim is not selected by a later run, and the cross-run failure count follows the Phase 1 decision.
-- [ ] Retry attempts use fresh message history and a thread ID unique per attempt.
-- [ ] No test path ends with a claim `in progress` after the run finishes.
+- [x] `uv run pytest agent/tests/test_agent.py backend/tests/test_runs.py backend/tests/test_agent_api.py -q --no-cov` passes with stubbed timeouts, provider errors and tool failures.
+- [x] A first failure before any decision returns the claim to `waiting`, records the failure, and the run retries the same claim. A successful retry finishes it without using another cap slot.
+- [x] A second failure before any decision marks the claim `needs handler` and its to-do item `left for handler`, and later selected claims still complete.
+- [x] A failure injected after the decision is saved never creates a second decision and never sets the claim to `waiting`. The run resumes sign-off or payment, and two failures there give `needs handler` with the decision intact.
+- [x] Replaying decision, sign-off or payment steps, including after a partial failure, creates no duplicate decision or payment.
+- [x] A simulated process crash mid-claim leaves expired leases. Recovery marks the run `interrupted` and resolves each stuck claim by its persisted state, with no orphaned claim left `in progress`.
+- [x] Final reconciliation retries any selected claim left `waiting` and does not finish the run while one is missed. A run where the agent selected fewer than `min(cap, waiting)` is rejected or corrected.
+- [x] A `needs handler` claim is not selected by a later run, and the cross-run failure count follows the Phase 1 decision.
+- [x] Retry attempts use fresh message history and a thread ID unique per attempt.
+- [x] No test path ends with a claim `in progress` after the run finishes.
 
 ## Phase 5: Show runs, to-dos and knowledge reads in the dashboard
 

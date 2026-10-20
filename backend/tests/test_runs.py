@@ -157,6 +157,208 @@ def test_simultaneous_acquisitions_have_one_winner(client: TestClient):
     assert len(database.get_run(run_id)["todos"]) == 1
 
 
+def test_failed_attempt_retries_in_run_and_failure_count_carries_across_runs(
+    client: TestClient,
+):
+    first_run = "first-failure-run"
+    database.create_run(first_run, "claim", 1)
+    database.select_run_claims(first_run, ["CLM-1001"])
+    first_todo = database.get_run(first_run)["todos"][0]
+    database.set_todo_status(first_todo["todo_id"], "in progress")
+
+    first_failure = database.fail_claim_attempt(
+        first_run, "CLM-1001", "Provider timeout"
+    )
+    first_attempt = database.get_claim_record("CLM-1001")
+    retry_number = database.retry_claim_attempt(first_run, "CLM-1001")
+    retried = database.get_run(first_run)["todos"][0]
+
+    assert first_failure == {
+        "failure_count": 1,
+        "retry": True,
+        "claim_status": "waiting",
+        "todo_status": "to do",
+    }
+    assert first_attempt is not None
+    assert first_attempt["status"] == "waiting"
+    assert retry_number == 2
+    assert retried["attempt_count"] == 2
+
+    database.fail_claim_attempt(first_run, "CLM-1001", "Tool failed again")
+    failed = database.get_claim_record("CLM-1001")
+    failed_todo = database.get_run(first_run)["todos"][0]
+
+    assert failed is not None
+    assert failed["status"] == "needs handler"
+    assert failed["failure_count"] == 2
+    assert failed_todo["status"] == "left for handler"
+
+
+def test_failure_count_from_an_interrupted_run_applies_to_next_run(
+    client: TestClient,
+):
+    first_run = "cross-run-first"
+    database.create_run(first_run, "claim", 1)
+    database.select_run_claims(first_run, ["CLM-1001"])
+    first_todo = database.get_run(first_run)["todos"][0]
+    database.set_todo_status(first_todo["todo_id"], "in progress")
+    database.fail_claim_attempt(first_run, "CLM-1001", "Provider timeout")
+    database.interrupt_run(first_run)
+
+    second_run = "cross-run-second"
+    database.create_run(second_run, "queue", 1)
+    database.select_run_claims(second_run, ["CLM-1001"])
+    second_todo = database.get_run(second_run)["todos"][0]
+    database.set_todo_status(second_todo["todo_id"], "in progress")
+    result = database.fail_claim_attempt(second_run, "CLM-1001", "Tool failed")
+    claim = database.get_claim_record("CLM-1001")
+
+    assert result["failure_count"] == 2
+    assert result["retry"] is False
+    assert claim is not None
+    assert claim["failure_count"] == 2
+    assert claim["status"] == "needs handler"
+    assert "CLM-1001" not in database.list_waiting_claim_ids(25)
+
+
+def test_expired_run_is_interrupted_and_creates_a_recovery_run(
+    client: TestClient,
+):
+    run_id = "crashed-run"
+    database.create_run(run_id, "queue", 1)
+    database.select_run_claims(run_id, ["CLM-1001"])
+    todo = database.get_run(run_id)["todos"][0]
+    database.set_todo_status(todo["todo_id"], "in progress")
+    with database.connection() as db:
+        db.execute(
+            "UPDATE runs SET heartbeat_at = '2000-01-01 00:00:00' WHERE run_id = ?",
+            (run_id,),
+        )
+        db.execute(
+            "UPDATE claims SET lease_at = '2000-01-01 00:00:00' "
+            "WHERE claim_id = 'CLM-1001'"
+        )
+
+    continuation_id = database.recover_expired_run(run_id, 300)
+    old_run = database.get_run(run_id)
+    assert continuation_id is not None
+    recovery = database.get_run(continuation_id)
+    claim = database.get_claim_record("CLM-1001")
+
+    assert old_run is not None
+    assert old_run["status"] == "interrupted"
+    assert "lease expired" in old_run["summary"]
+    assert recovery is not None
+    assert recovery["run_type"] == "recovery"
+    assert recovery["selection_complete"] == 1
+    assert recovery["todos"][0]["claim_id"] == "CLM-1001"
+    assert claim is not None
+    assert claim["status"] == "in progress"
+    assert claim["run_id"] == continuation_id
+    assert claim["failure_count"] == 1
+
+    second_failure = database.fail_claim_attempt(
+        continuation_id, "CLM-1001", "Recovery attempt failed"
+    )
+    claim_after = database.get_claim_record("CLM-1001")
+
+    assert second_failure["retry"] is False
+    assert claim_after is not None
+    assert claim_after["status"] == "needs handler"
+    assert claim_after["failure_count"] == 2
+
+
+def test_recovery_uses_saved_decision_state_to_resume_only_incomplete_work(
+    client: TestClient,
+):
+    run_id = "partial-decision-crash"
+    database.create_run(run_id, "queue", 2)
+    database.select_run_claims(run_id, ["CLM-1001", "CLM-1002"])
+    todos = database.get_run(run_id)["todos"]
+    for todo in todos:
+        database.set_todo_status(todo["todo_id"], "in progress")
+    database.save_decision(
+        "CLM-1001",
+        {"outcome": "refer", "payout_inr": 0.0, "needs_sign_off": False},
+        "decided",
+    )
+    database.save_decision(
+        "CLM-1002",
+        {"outcome": "approve", "payout_inr": 500.0, "needs_sign_off": False},
+        "decided",
+    )
+    with database.connection() as db:
+        db.execute(
+            "UPDATE runs SET heartbeat_at = '2000-01-01 00:00:00' WHERE run_id = ?",
+            (run_id,),
+        )
+
+    continuation_id = database.recover_expired_run(run_id, 300)
+    old_run = database.get_run(run_id)
+    assert continuation_id is not None
+    continuation = database.get_run(continuation_id)
+    completed_claim = database.get_claim_record("CLM-1001")
+    resumed_claim = database.get_claim_record("CLM-1002")
+
+    assert old_run is not None
+    assert [todo["status"] for todo in old_run["todos"]] == ["done", "to do"]
+    assert continuation is not None
+    assert [todo["claim_id"] for todo in continuation["todos"]] == ["CLM-1002"]
+    assert completed_claim is not None
+    assert completed_claim["status"] == "decided"
+    assert completed_claim["failure_count"] == 0
+    assert resumed_claim is not None
+    assert resumed_claim["decision"]["outcome"] == "approve"
+    assert resumed_claim["status"] == "in progress"
+    assert resumed_claim["failure_count"] == 1
+
+
+def test_new_run_recovers_expired_run_before_accepting_queue_work(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    run_id = "expired-before-new-run"
+    database.create_run(run_id, "queue", 1)
+    database.select_run_claims(run_id, ["CLM-1001"])
+    todo = database.get_run(run_id)["todos"][0]
+    database.set_todo_status(todo["todo_id"], "in progress")
+    with database.connection() as db:
+        db.execute(
+            "UPDATE runs SET heartbeat_at = '2000-01-01 00:00:00' WHERE run_id = ?",
+            (run_id,),
+        )
+        db.execute(
+            "UPDATE claims SET lease_at = '2000-01-01 00:00:00' "
+            "WHERE claim_id = 'CLM-1001'"
+        )
+
+    started_threads = []
+
+    class DeferredThread:
+        def __init__(self, target, args, daemon):
+            self.target = target
+            self.args = args
+            started_threads.append((target, args, daemon))
+
+        def start(self):
+            self.target(*self.args)
+
+    monkeypatch.setattr(main, "Thread", DeferredThread)
+    monkeypatch.setattr(main, "run_queue_agent", finish_stub_queue)
+    response = client.post("/api/agent/runs", json={"max_claims": 1})
+    current = client.get("/api/agent/runs/current").json()["run"]
+    recovery_id = started_threads[0][1][0]
+    recovery_run = client.get(f"/api/agent/runs/{recovery_id}").json()
+    claim = client.get("/api/claims/CLM-1001").json()
+
+    assert response.status_code == 200
+    assert database.get_run(run_id)["status"] == "interrupted"
+    assert recovery_run["run_type"] == "recovery"
+    assert recovery_run["status"] == "completed"
+    assert claim["status"] == "decided"
+    assert current is None
+    assert len(started_threads) == 1
+
+
 def test_run_todo_plan_requires_the_selected_claims(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ):
@@ -202,6 +404,10 @@ def test_todo_statuses_are_persisted_and_invalid_status_is_rejected(
     todo_id = run["todos"][0]["todo_id"]
 
     for status in ("to do", "in progress", "done", "left for handler"):
+        if status == "done":
+            database.save_decision(run["todos"][0]["claim_id"], decision(), "decided")
+        if status == "left for handler":
+            database.set_claim_status(run["todos"][0]["claim_id"], "needs handler")
         update = client.patch(
             f"/api/agent/runs/{run_id}/todos/{todo_id}", json={"status": status}
         )
@@ -270,6 +476,31 @@ def test_named_claim_creates_a_one_item_run(
     assert run["max_claims"] == 1
     assert [item["claim_id"] for item in run["todos"]] == ["CLM-1001"]
     assert run["todos"][0]["status"] == "to do"
+
+
+def test_queue_cannot_close_with_a_short_batch_or_unresolved_claim(
+    client: TestClient,
+):
+    run_id = "reconcile-run"
+    database.create_run(run_id, "queue", 2)
+    short_selection = client.post(
+        f"/api/agent/runs/{run_id}/select", json={"claim_ids": ["CLM-1001"]}
+    )
+
+    assert short_selection.status_code == 422
+    assert (
+        client.post(
+            f"/api/agent/runs/{run_id}/select",
+            json={"claim_ids": ["CLM-1001", "CLM-1002"]},
+        ).status_code
+        == 200
+    )
+    close = client.post(
+        f"/api/agent/runs/{run_id}/complete", json={"summary": "Incomplete."}
+    )
+
+    assert close.status_code == 409
+    assert "unfinished work" in close.json()["detail"]
 
 
 def test_initialize_deduplicates_old_decisions_and_adds_unique_constraints(

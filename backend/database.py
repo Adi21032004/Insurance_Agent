@@ -8,11 +8,13 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal
+from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 DATABASE_PATH = Path(os.getenv("UNDERCOVER_DB_PATH", str(ROOT / ".undercover.sqlite3")))
 RecordTable = Literal["decisions", "payments", "signoffs"]
+MAX_CLAIM_FAILURES = 2
 RECORD_SQL = {
     "decisions": {
         "select": "SELECT rowid AS migration_rowid, claim_id, decision_json, "
@@ -49,6 +51,30 @@ def connection() -> Iterator[sqlite3.Connection]:
         raise
     finally:
         db.close()
+
+
+def touch_claim_lease(db: sqlite3.Connection, claim_id: str) -> None:
+    """Refresh the run and claim heartbeat while claim work is active."""
+    db.execute(
+        "UPDATE claims SET lease_at = CURRENT_TIMESTAMP "
+        "WHERE claim_id = ? AND run_id IS NOT NULL AND EXISTS ("
+        "SELECT 1 FROM runs WHERE runs.run_id = claims.run_id "
+        "AND runs.status = 'in progress')",
+        (claim_id,),
+    )
+    db.execute(
+        "UPDATE runs SET heartbeat_at = CURRENT_TIMESTAMP WHERE run_id = "
+        "(SELECT run_id FROM claims WHERE claim_id = ?)",
+        (claim_id,),
+    )
+
+
+def touch_run(db: sqlite3.Connection, run_id: str) -> None:
+    """Refresh one persisted run heartbeat."""
+    db.execute(
+        "UPDATE runs SET heartbeat_at = CURRENT_TIMESTAMP WHERE run_id = ?",
+        (run_id,),
+    )
 
 
 def read_json(filename: str) -> Any:
@@ -182,6 +208,33 @@ def backfill_claim_records(db: sqlite3.Connection) -> None:
         )
 
 
+def ensure_workflow_columns(db: sqlite3.Connection) -> None:
+    """Add run, lease and retry fields to pilot databases."""
+    columns = {row[1] for row in db.execute("PRAGMA table_info(claims)").fetchall()}
+    for name, declaration in (
+        ("failure_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("run_id", "TEXT"),
+        ("lease_at", "TEXT"),
+    ):
+        if name not in columns:
+            db.execute(f"ALTER TABLE claims ADD COLUMN {name} {declaration}")
+    run_columns = {row[1] for row in db.execute("PRAGMA table_info(runs)").fetchall()}
+    for name, declaration in (
+        ("selection_complete", "INTEGER NOT NULL DEFAULT 0"),
+        ("required_claims", "INTEGER"),
+        ("heartbeat_at", "TEXT"),
+    ):
+        if name not in run_columns:
+            db.execute(f"ALTER TABLE runs ADD COLUMN {name} {declaration}")
+    todo_columns = {
+        row[1] for row in db.execute("PRAGMA table_info(run_todos)").fetchall()
+    }
+    if "attempt_count" not in todo_columns:
+        db.execute(
+            "ALTER TABLE run_todos ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"
+        )
+
+
 def initialize_database() -> None:
     """Create the schema and seed the claims queue once."""
     claims = read_json("claims.json")
@@ -211,7 +264,8 @@ def initialize_database() -> None:
                 sign_off_handler_id TEXT,
                 payment_json TEXT,
                 run_id TEXT,
-                failure_count INTEGER NOT NULL DEFAULT 0
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                lease_at TEXT
             );
             CREATE TABLE IF NOT EXISTS events (
                 event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -231,6 +285,7 @@ def initialize_database() -> None:
                 status TEXT NOT NULL,
                 summary TEXT,
                 selection_complete INTEGER NOT NULL DEFAULT 0,
+                required_claims INTEGER,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 finished_at TEXT,
                 heartbeat_at TEXT
@@ -242,6 +297,7 @@ def initialize_database() -> None:
                 claim_id TEXT NOT NULL REFERENCES claims(claim_id),
                 description TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'to do',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(run_id, position),
                 UNIQUE(run_id, claim_id)
             );
@@ -279,23 +335,7 @@ def initialize_database() -> None:
             );
             """
         )
-        columns = {row[1] for row in db.execute("PRAGMA table_info(claims)").fetchall()}
-        for name, declaration in (
-            ("failure_count", "INTEGER NOT NULL DEFAULT 0"),
-            ("run_id", "TEXT"),
-        ):
-            if name not in columns:
-                db.execute(f"ALTER TABLE claims ADD COLUMN {name} {declaration}")
-        run_columns = {
-            row[1] for row in db.execute("PRAGMA table_info(runs)").fetchall()
-        }
-        if "selection_complete" not in run_columns:
-            db.execute(
-                "ALTER TABLE runs ADD COLUMN selection_complete "
-                "INTEGER NOT NULL DEFAULT 0"
-            )
-        if "heartbeat_at" not in run_columns:
-            db.execute("ALTER TABLE runs ADD COLUMN heartbeat_at TEXT")
+        ensure_workflow_columns(db)
         count = db.execute("SELECT COUNT(*) FROM claims").fetchone()[0]
         if not count:
             for claim in claims:
@@ -441,6 +481,7 @@ def record_source_read(claim_id: str, section: dict[str, str]) -> None:
                 section["content"],
             ),
         )
+        touch_claim_lease(db, claim_id)
 
 
 def list_source_reads(claim_id: str) -> list[dict[str, Any]]:
@@ -458,7 +499,10 @@ def set_claim_status(claim_id: str, status: str) -> None:
     """Set the queue status for one claim."""
     with connection() as db:
         result = db.execute(
-            "UPDATE claims SET status = ? WHERE claim_id = ?", (status, claim_id)
+            "UPDATE claims SET status = ?, lease_at = CASE "
+            "WHEN ? = 'in progress' THEN CURRENT_TIMESTAMP ELSE NULL END "
+            "WHERE claim_id = ?",
+            (status, status, claim_id),
         )
     if result.rowcount == 0:
         raise KeyError(claim_id)
@@ -471,6 +515,7 @@ def add_event(claim_id: str, step: str, detail: str) -> None:
             "INSERT INTO events (claim_id, step, detail) VALUES (?, ?, ?)",
             (claim_id, step, detail),
         )
+        touch_claim_lease(db, claim_id)
 
 
 def save_decision(claim_id: str, decision: dict[str, Any], status: str) -> None:
@@ -486,7 +531,8 @@ def save_decision(claim_id: str, decision: dict[str, Any], status: str) -> None:
                 return
             raise ValueError("Claim already has a different decision")
         result = db.execute(
-            "UPDATE claims SET decision_json = ?, status = ? "
+            "UPDATE claims SET decision_json = ?, status = ?, "
+            "lease_at = CURRENT_TIMESTAMP "
             "WHERE claim_id = ? AND decision_json IS NULL",
             (decision_json, status, claim_id),
         )
@@ -497,6 +543,7 @@ def save_decision(claim_id: str, decision: dict[str, Any], status: str) -> None:
             "VALUES (?, ?, ?)",
             (claim_id, decision_json, key),
         )
+        touch_claim_lease(db, claim_id)
 
 
 def sign_off_claim(claim_id: str, handler_id: str) -> None:
@@ -539,7 +586,9 @@ def save_payment(claim_id: str, amount_inr: float) -> None:
                 return
             raise ValueError("Claim already has a different payment")
         result = db.execute(
-            "UPDATE claims SET payment_json = ? WHERE claim_id = ? "
+            "UPDATE claims SET payment_json = ?, status = 'decided', "
+            "failure_count = 0, lease_at = NULL "
+            "WHERE claim_id = ? "
             "AND payment_json IS NULL",
             (payment_json, claim_id),
         )
@@ -557,8 +606,8 @@ def create_run(run_id: str, run_type: str, max_claims: int) -> None:
     with connection() as db:
         try:
             db.execute(
-                "INSERT INTO runs (run_id, run_type, max_claims, status) "
-                "VALUES (?, ?, ?, 'in progress')",
+                "INSERT INTO runs (run_id, run_type, max_claims, status, heartbeat_at) "
+                "VALUES (?, ?, ?, 'in progress', CURRENT_TIMESTAMP)",
                 (run_id, run_type, max_claims),
             )
         except sqlite3.IntegrityError as error:
@@ -624,7 +673,8 @@ def select_run_claims(run_id: str, claim_ids: list[str]) -> None:
         validate_claims_waiting(db, claim_ids)
         for position, claim_id in enumerate(claim_ids):
             updated = db.execute(
-                "UPDATE claims SET status = 'in progress', run_id = ? "
+                "UPDATE claims SET status = 'in progress', run_id = ?, "
+                "lease_at = CURRENT_TIMESTAMP "
                 "WHERE claim_id = ? AND status = 'waiting'",
                 (run_id, claim_id),
             )
@@ -635,7 +685,11 @@ def select_run_claims(run_id: str, claim_ids: list[str]) -> None:
                 "(run_id, position, claim_id, description) VALUES (?, ?, ?, ?)",
                 (run_id, position, claim_id, f"Review {claim_id}"),
             )
-        db.execute("UPDATE runs SET selection_complete = 1 WHERE run_id = ?", (run_id,))
+        db.execute(
+            "UPDATE runs SET selection_complete = 1, required_claims = ?, "
+            "heartbeat_at = CURRENT_TIMESTAMP WHERE run_id = ?",
+            (len(claim_ids), run_id),
+        )
 
 
 def plan_run_todos(run_id: str, items: list[dict[str, str]]) -> None:
@@ -650,7 +704,7 @@ def plan_run_todos(run_id: str, items: list[dict[str, str]]) -> None:
         if run["status"] != "in progress":
             raise ValueError("Run is not active")
         current = db.execute(
-            "SELECT todo_id, position, claim_id, status FROM run_todos "
+            "SELECT todo_id, position, claim_id, status, attempt_count FROM run_todos "
             "WHERE run_id = ? ORDER BY position",
             (run_id,),
         ).fetchall()
@@ -670,6 +724,7 @@ def plan_run_todos(run_id: str, items: list[dict[str, str]]) -> None:
                 "WHERE run_id = ? AND claim_id = ?",
                 (position, item["description"], run_id, item["claim_id"]),
             )
+        touch_run(db, run_id)
 
 
 def get_run(run_id: str) -> dict[str, Any] | None:
@@ -679,7 +734,8 @@ def get_run(run_id: str) -> dict[str, Any] | None:
         if row is None:
             return None
         todos = db.execute(
-            "SELECT todo_id, position, claim_id, description, status FROM run_todos "
+            "SELECT todo_id, position, claim_id, description, status, attempt_count "
+            "FROM run_todos "
             "WHERE run_id = ? ORDER BY position",
             (run_id,),
         ).fetchall()
@@ -699,11 +755,36 @@ def get_current_run() -> dict[str, Any] | None:
 def set_todo_status(todo_id: int, status: str) -> None:
     """Update the state of one persisted work item."""
     with connection() as db:
-        result = db.execute(
-            "UPDATE run_todos SET status = ? WHERE todo_id = ?", (status, todo_id)
+        todo = db.execute(
+            "SELECT run_id, claim_id, status FROM run_todos WHERE todo_id = ?",
+            (todo_id,),
+        ).fetchone()
+        if todo is None:
+            raise KeyError(todo_id)
+        db.execute(
+            "UPDATE run_todos SET status = ?, attempt_count = attempt_count + ? "
+            "WHERE todo_id = ?",
+            (
+                status,
+                int(status == "in progress" and todo["status"] != "in progress"),
+                todo_id,
+            ),
         )
-    if result.rowcount == 0:
-        raise KeyError(todo_id)
+        touch_run(db, todo["run_id"])
+        if status == "in progress":
+            touch_claim_lease(db, todo["claim_id"])
+        elif status == "done":
+            db.execute(
+                "UPDATE claims SET failure_count = 0, lease_at = NULL "
+                "WHERE claim_id = ? AND decision_json IS NOT NULL",
+                (todo["claim_id"],),
+            )
+        elif status == "left for handler":
+            db.execute(
+                "UPDATE claims SET status = 'needs handler', lease_at = NULL "
+                "WHERE claim_id = ?",
+                (todo["claim_id"],),
+            )
 
 
 def set_todo_status_for_claim(run_id: str, claim_id: str, status: str) -> None:
@@ -720,7 +801,8 @@ def finish_run(run_id: str, summary: str) -> None:
     with connection() as db:
         db.execute(
             "UPDATE runs SET status = 'completed', summary = ?, "
-            "finished_at = CURRENT_TIMESTAMP WHERE run_id = ?",
+            "finished_at = CURRENT_TIMESTAMP, heartbeat_at = CURRENT_TIMESTAMP "
+            "WHERE run_id = ? AND status = 'in progress'",
             (summary, run_id),
         )
 
@@ -730,22 +812,311 @@ def interrupt_run(run_id: str) -> None:
     with connection() as db:
         db.execute(
             "UPDATE runs SET status = 'interrupted', "
-            "finished_at = CURRENT_TIMESTAMP WHERE run_id = ? "
+            "finished_at = CURRENT_TIMESTAMP, "
+            "summary = COALESCE(summary, 'Run interrupted before completion.'), "
+            "heartbeat_at = CURRENT_TIMESTAMP WHERE run_id = ? "
             "AND status = 'in progress'",
             (run_id,),
         )
 
 
-def fail_claim_attempt(claim_id: str) -> int:
-    """Count a failed claim attempt and return the updated total."""
+def fail_claim_attempt(run_id: str, claim_id: str, detail: str) -> dict[str, Any]:
+    """Persist one failed attempt and resolve its retry or handler state."""
     with connection() as db:
-        db.execute(
-            "UPDATE claims SET failure_count = failure_count + 1 WHERE claim_id = ?",
-            (claim_id,),
-        )
-        row = db.execute(
-            "SELECT failure_count FROM claims WHERE claim_id = ?", (claim_id,)
+        db.execute("BEGIN IMMEDIATE")
+        todo = db.execute(
+            "SELECT todo_id FROM run_todos WHERE run_id = ? AND claim_id = ?",
+            (run_id, claim_id),
         ).fetchone()
-    if row is None:
-        raise KeyError(claim_id)
-    return int(row["failure_count"])
+        claim = db.execute(
+            "SELECT decision_json, payment_json, sign_off_handler_id, failure_count "
+            "FROM claims WHERE claim_id = ? "
+            "AND run_id = ?",
+            (claim_id, run_id),
+        ).fetchone()
+        run = db.execute(
+            "SELECT status FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if todo is None or claim is None:
+            raise KeyError(claim_id)
+        if run is None or run["status"] != "in progress":
+            raise ValueError("Run is not active")
+        decision = (
+            json.loads(claim["decision_json"]) if claim["decision_json"] else None
+        )
+        payment = json.loads(claim["payment_json"]) if claim["payment_json"] else None
+        awaiting_signoff = bool(
+            decision
+            and decision["outcome"] == "approve"
+            and decision["needs_sign_off"]
+            and claim["sign_off_handler_id"] is None
+            and payment is None
+        )
+        already_complete = bool(
+            decision
+            and (
+                decision["outcome"] != "approve"
+                or payment is not None
+                or awaiting_signoff
+            )
+        )
+        if already_complete:
+            claim_status = "waiting for sign-off" if awaiting_signoff else "decided"
+            db.execute(
+                "UPDATE claims SET status = ?, failure_count = 0, lease_at = NULL "
+                "WHERE claim_id = ?",
+                (claim_status, claim_id),
+            )
+            db.execute(
+                "UPDATE run_todos SET status = 'done' WHERE todo_id = ?",
+                (todo["todo_id"],),
+            )
+            touch_run(db, run_id)
+            return {
+                "failure_count": 0,
+                "retry": False,
+                "already_complete": True,
+                "claim_status": claim_status,
+                "todo_status": "done",
+            }
+        failures = int(claim["failure_count"]) + 1
+        retry = failures < MAX_CLAIM_FAILURES
+        if not retry:
+            status = "needs handler"
+            todo_status = "left for handler"
+        elif claim["decision_json"] is None:
+            status = "waiting"
+            todo_status = "to do"
+        else:
+            status = "in progress"
+            todo_status = "to do"
+        db.execute(
+            "UPDATE claims SET failure_count = ?, status = ?, lease_at = "
+            "CASE WHEN ? = 'in progress' THEN CURRENT_TIMESTAMP ELSE NULL END "
+            "WHERE claim_id = ?",
+            (failures, status, status, claim_id),
+        )
+        db.execute(
+            "UPDATE run_todos SET status = ? WHERE todo_id = ?",
+            (todo_status, todo["todo_id"]),
+        )
+        db.execute(
+            "INSERT INTO events (claim_id, step, detail) VALUES (?, ?, ?)",
+            (claim_id, "Attempt failed", f"Attempt {failures}: {detail}"),
+        )
+        touch_run(db, run_id)
+        return {
+            "failure_count": failures,
+            "retry": retry,
+            "claim_status": status,
+            "todo_status": todo_status,
+        }
+
+
+def retry_claim_attempt(run_id: str, claim_id: str) -> int:
+    """Reacquire one claim for a retry in its existing run."""
+    with connection() as db:
+        db.execute("BEGIN IMMEDIATE")
+        run = db.execute(
+            "SELECT status FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        todo = db.execute(
+            "SELECT todo_id, status, attempt_count FROM run_todos "
+            "WHERE run_id = ? AND claim_id = ?",
+            (run_id, claim_id),
+        ).fetchone()
+        claim = db.execute(
+            "SELECT status, failure_count, decision_json "
+            "FROM claims WHERE claim_id = ? "
+            "AND run_id = ?",
+            (claim_id, run_id),
+        ).fetchone()
+        if run is None or todo is None or claim is None:
+            raise KeyError(claim_id)
+        if run["status"] != "in progress":
+            raise ValueError("Run is not active")
+        if claim["failure_count"] >= MAX_CLAIM_FAILURES:
+            raise ValueError("Claim already needs handler attention")
+        if todo["status"] != "to do":
+            raise ValueError("Claim is not ready for retry")
+        if claim["status"] == "waiting":
+            updated = db.execute(
+                "UPDATE claims SET status = 'in progress', lease_at = "
+                "CURRENT_TIMESTAMP WHERE claim_id = ? AND status = 'waiting' "
+                "AND run_id = ?",
+                (claim_id, run_id),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("Claim could not be reacquired for retry")
+        elif claim["status"] != "in progress" or claim["decision_json"] is None:
+            raise ValueError("Claim state is not retryable")
+        db.execute(
+            "UPDATE run_todos SET status = 'in progress', "
+            "attempt_count = attempt_count + 1 WHERE todo_id = ?",
+            (todo["todo_id"],),
+        )
+        db.execute(
+            "INSERT INTO events (claim_id, step, detail) VALUES (?, ?, ?)",
+            (claim_id, "Attempt started", f"Attempt {int(todo['attempt_count']) + 1}."),
+        )
+        touch_run(db, run_id)
+        return int(todo["attempt_count"]) + 1
+
+
+def expired_run_ids(lease_seconds: int) -> list[str]:
+    """List active runs whose heartbeat lease has expired."""
+    with connection() as db:
+        rows = db.execute(
+            "SELECT run_id FROM runs WHERE status = 'in progress' AND "
+            "COALESCE(heartbeat_at, created_at) <= datetime('now', ?) "
+            "ORDER BY created_at",
+            (f"-{lease_seconds} seconds",),
+        ).fetchall()
+    return [row["run_id"] for row in rows]
+
+
+def recover_expired_todo(
+    db: sqlite3.Connection, run_id: str, todo: sqlite3.Row
+) -> bool:
+    """Resolve persisted claim state and report whether it needs continuation."""
+    decision = json.loads(todo["decision_json"]) if todo["decision_json"] else None
+    payment = json.loads(todo["payment_json"]) if todo["payment_json"] else None
+    needs_handler_signoff = bool(
+        decision
+        and decision["outcome"] == "approve"
+        and decision["needs_sign_off"]
+        and todo["sign_off_handler_id"] is None
+        and payment is None
+    )
+    already_complete = bool(
+        decision
+        and (
+            decision["outcome"] != "approve"
+            or payment is not None
+            or needs_handler_signoff
+        )
+    )
+    if already_complete:
+        status = "waiting for sign-off" if needs_handler_signoff else "decided"
+        db.execute(
+            "UPDATE claims SET status = ?, failure_count = 0, lease_at = NULL "
+            "WHERE claim_id = ?",
+            (status, todo["claim_id"]),
+        )
+        db.execute(
+            "UPDATE run_todos SET status = 'done' WHERE todo_id = ?",
+            (todo["todo_id"],),
+        )
+        return False
+
+    waiting_for_retry = todo["claim_status"] == "waiting" and todo["status"] == "to do"
+    needs_payment_resume = bool(
+        decision
+        and decision["outcome"] == "approve"
+        and payment is None
+        and not needs_handler_signoff
+    )
+    stuck = todo["claim_status"] == "in progress" or needs_payment_resume
+    if not waiting_for_retry and not stuck:
+        if todo["claim_status"] == "needs handler":
+            db.execute(
+                "UPDATE run_todos SET status = 'left for handler' WHERE todo_id = ?",
+                (todo["todo_id"],),
+            )
+        return False
+
+    failures = int(todo["failure_count"])
+    if stuck:
+        failures += 1
+        db.execute(
+            "INSERT INTO events (claim_id, step, detail) "
+            "VALUES (?, 'Attempt interrupted', ?)",
+            (todo["claim_id"], f"Run {run_id} lease expired."),
+        )
+    if failures >= MAX_CLAIM_FAILURES:
+        db.execute(
+            "UPDATE claims SET failure_count = ?, status = 'needs handler', "
+            "lease_at = NULL WHERE claim_id = ?",
+            (failures, todo["claim_id"]),
+        )
+        db.execute(
+            "UPDATE run_todos SET status = 'left for handler' WHERE todo_id = ?",
+            (todo["todo_id"],),
+        )
+        return False
+
+    db.execute(
+        "UPDATE claims SET failure_count = ?, status = 'waiting', lease_at = NULL "
+        "WHERE claim_id = ?",
+        (failures, todo["claim_id"]),
+    )
+    db.execute(
+        "UPDATE run_todos SET status = 'to do' WHERE todo_id = ?",
+        (todo["todo_id"],),
+    )
+    return True
+
+
+def recover_expired_run(
+    run_id: str, lease_seconds: int, force: bool = False
+) -> str | None:
+    """Interrupt an expired run and create a continuation for recoverable claims."""
+    cutoff = f"-{lease_seconds} seconds"
+    with connection() as db:
+        db.execute("BEGIN IMMEDIATE")
+        run = db.execute(
+            "SELECT * FROM runs WHERE run_id = ? AND status = 'in progress' "
+            "AND (? = 1 OR COALESCE(heartbeat_at, created_at) <= datetime('now', ?))",
+            (run_id, int(force), cutoff),
+        ).fetchone()
+        if run is None:
+            return None
+        todos = db.execute(
+            "SELECT t.todo_id, t.position, t.claim_id, t.description, t.status, "
+            "c.status AS claim_status, c.failure_count, c.decision_json, "
+            "c.payment_json, c.sign_off_handler_id, c.lease_at "
+            "FROM run_todos AS t JOIN claims AS c USING (claim_id) "
+            "WHERE t.run_id = ? ORDER BY t.position",
+            (run_id,),
+        ).fetchall()
+        resumes = [todo for todo in todos if recover_expired_todo(db, run_id, todo)]
+
+        continuation_id = str(uuid4()) if resumes else None
+        summary = "Run interrupted after its heartbeat lease expired."
+        if continuation_id:
+            summary += f" Recoverable claims moved to run {continuation_id}."
+        db.execute(
+            "UPDATE runs SET status = 'interrupted', summary = ?, "
+            "finished_at = CURRENT_TIMESTAMP WHERE run_id = ?",
+            (summary, run_id),
+        )
+        if continuation_id is not None:
+            db.execute(
+                "INSERT INTO runs (run_id, run_type, max_claims, status, summary, "
+                "selection_complete, required_claims, heartbeat_at) "
+                "VALUES (?, 'recovery', ?, 'in progress', ?, 1, ?, CURRENT_TIMESTAMP)",
+                (
+                    continuation_id,
+                    len(resumes),
+                    f"Resuming interrupted run {run_id}.",
+                    len(resumes),
+                ),
+            )
+            for position, todo in enumerate(resumes):
+                db.execute(
+                    "UPDATE claims SET status = 'in progress', run_id = ?, "
+                    "lease_at = CURRENT_TIMESTAMP WHERE claim_id = ?",
+                    (continuation_id, todo["claim_id"]),
+                )
+                db.execute(
+                    "INSERT INTO run_todos "
+                    "(run_id, position, claim_id, description) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        continuation_id,
+                        position,
+                        todo["claim_id"],
+                        todo["description"],
+                    ),
+                )
+        return continuation_id

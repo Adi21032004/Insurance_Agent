@@ -8,6 +8,7 @@ QUEUE_INSTRUCTIONS = " ".join(
         "Reserve every selected claim through the backend before delegating it.",
         "Give each claim to a fresh claim helper and let it finish that claim.",
         "Keep every to-do state current and continue after an individual failure.",
+        "Retry a failed claim once with a fresh helper and unique thread.",
         "Do not decide claims yourself or read local files.",
         "Finish with a short summary for the handlers.",
     ]
@@ -32,6 +33,8 @@ CLAIM_INSTRUCTIONS = " ".join(
         "Record progress as you review the claim.",
         "Record the decision with the policy section, manual version and sections",
         "relied on.",
+        "On a retry, follow the persisted claim state and never create a second",
+        "decision when one is already saved.",
         "Explain the decision in two or three sentences.",
         "If an approved payout needs handler sign-off, the backend blocks payment",
         "until sign-off.",
