@@ -109,10 +109,10 @@ Add a queue-run control with an explicit claim cap and keep the single-claim con
 
 Success criteria:
 
-- [ ] `npm run check:ts` passes, including dashboard tests and strict TypeScript checks.
-- [ ] Dashboard tests cover starting a capped run, starting one named claim, live to-do state changes, the completed summary, `needs handler`, claim source sections, both instruction sets and API failure states.
-- [ ] In the Playwright browser at `http://localhost:5173`, the queue can start a five-claim run, displays the current to-do list and summary, and shows an individual claim's recorded policy and manual sections.
-- [ ] The instructions page displays the queue and claim instructions as read-only text, and the queue reflects a claim moved to `needs handler`.
+- [x] `npm run check:ts` passes, including dashboard tests and strict TypeScript checks.
+- [x] Dashboard tests cover starting a capped run, starting one named claim, live to-do state changes, the completed summary, `needs handler`, claim source sections, both instruction sets and API failure states.
+- [x] In the Playwright browser at the configured dashboard URL, the queue can start a five-claim run, displays the current to-do list and summary, and shows an individual claim's recorded policy and manual sections.
+- [x] The instructions page displays the queue and claim instructions as read-only text, and the queue reflects a claim moved to `needs handler`.
 
 ## Phase 6: Integrate, update product docs and run acceptance checks
 
@@ -120,9 +120,11 @@ Update `docs/TECH_STACK.md` with the new default model and queue/subagent entry 
 
 Success criteria:
 
-- [ ] `uv run pytest -q` passes with at least 80% backend and agent coverage; all agent tests use stubs.
-- [ ] `npm run check` passes: Python formatting, lint, types and tests; TypeScript formatting, lint, types and tests; and Playwright end-to-end tests.
-- [ ] Playwright end-to-end tests cover a capped run, an unselected waiting claim, to-do progress, section reads, a claim failure that does not stop the run, a retry, a second failure routed to a handler, and missed-claim reconciliation.
-- [ ] In the Playwright browser, the queue, run summary, to-do list, claim detail, section-read display and instructions page load and update without console errors.
-- [ ] `docs/SPEC.md`, `docs/TECH_STACK.md` and `docs/STATUS.md` describe the implemented manual use, run and retry behavior, handler-review status, and default model. The pilot's `docs/PLAN.md` remains unchanged.
+- [x] `uv run pytest -q` passes with at least 80% backend and agent coverage; all agent tests use stubs.
+- [x] `npm run check` passes: Python formatting, lint, types and tests; TypeScript formatting, lint, types and tests; and Playwright end-to-end tests.
+- [x] Playwright end-to-end tests cover a capped run, an unselected waiting claim, to-do progress, section reads, a claim failure that does not stop the run, a retry, a second failure routed to a handler, and missed-claim reconciliation.
+- [x] In the Playwright browser, the queue, run summary, to-do list, claim detail, section-read display and instructions page load and update without console errors.
+- [x] `docs/SPEC.md`, `docs/TECH_STACK.md` and `docs/STATUS.md` describe the implemented manual use, run and retry behavior, handler-review status, and default model. The pilot's `docs/PLAN.md` remains unchanged.
 - [ ] With a fresh seeded local database and the default model enabled, an API or dashboard run capped at five processes five distinct claims, leaves the other claims waiting, and shows the run summary, to-dos and claim steps in the dashboard.
+
+The live-model acceptance check is pending because this machine has no `OPENROUTER_API_KEY` in its process environment or `.env` file. All automated agent checks use deterministic stubs.
