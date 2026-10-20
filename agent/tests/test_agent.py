@@ -201,7 +201,7 @@ def test_queue_reconciles_a_selected_claim_skipped_during_processing(
     assert run["status"] == "completed"
     assert [todo["claim_id"] for todo in run["todos"]] == selected
     assert all(todo["status"] == "done" for todo in run["todos"])
-    assert run["todos"][0]["attempt_count"] == 1
+    assert run["todos"][0]["attempt_count"] == 2
     assert "3 referred" in summary
     assert missed_once
 

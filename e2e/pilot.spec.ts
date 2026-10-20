@@ -89,6 +89,9 @@ test("a capped queue run retries, routes a second failure and leaves other claim
   await expect(
     runPanel.getByRole("listitem").filter({ hasText: "CLM-1002" }),
   ).toContainText("done");
+  await expect(
+    runPanel.getByRole("listitem").filter({ hasText: "CLM-1002" }),
+  ).toContainText("Attempts: 2");
   await expect(page.getByRole("button", { name: /CLM-1002/ })).toContainText(
     "decided",
   );

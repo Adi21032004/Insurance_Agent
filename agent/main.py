@@ -418,6 +418,12 @@ def run_queue(run_id: str, thread_id: str) -> str:
         if os.getenv("UNDERCOVER_AGENT_TEST_MODE") == "1" and scheduled_stub_miss(
             todo["claim_id"]
         ):
+            update_run_todo(run_id, todo["todo_id"], "in progress")
+            record_attempt_failure(
+                run_id,
+                todo["claim_id"],
+                "Test-only interrupted attempt before reconciliation.",
+            )
             continue
         outcome, needs_handler = process_run_todo(run_id, thread_id, todo)
         if outcome is not None:
