@@ -1,0 +1,381 @@
+import json
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from threading import Barrier
+
+import pytest
+from fastapi.testclient import TestClient
+
+from backend import database, main
+from backend.main import app
+
+
+def decision(reason: str = "A handler should review the claim.") -> dict[str, object]:
+    return {
+        "outcome": "refer",
+        "reason": reason,
+        "policy_section": "Section 3: Trip Delay",
+        "calculation": [],
+        "payout_inr": 0.0,
+        "needs_sign_off": False,
+    }
+
+
+def test_queue_run_is_capped_and_persists_ordered_todos(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setattr(database, "DATABASE_PATH", tmp_path / "claims.sqlite3")
+
+    def decide(claim_id: str, thread_id: str) -> str:
+        database.save_decision(claim_id, decision(), "decided")
+        return "Referred for review."
+
+    monkeypatch.setattr(main, "run_agent", decide)
+    with TestClient(app) as client:
+        response = client.post("/api/agent/runs", json={"max_claims": 5})
+        run_id = response.json()["run_id"]
+        run = client.get(f"/api/agent/runs/{run_id}").json()
+        queue = client.get("/api/claims").json()["claims"]
+        active = client.get("/api/agent/runs/current").json()
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "in progress"
+    assert response.json()["max_claims"] == 5
+    assert run["status"] == "completed"
+    assert len(run["todos"]) == 5
+    assert [item["position"] for item in run["todos"]] == list(range(5))
+    assert {item["status"] for item in run["todos"]} == {"done"}
+    assert sum(claim["status"] == "waiting" for claim in queue) == 20
+    assert active == {"run": None}
+
+
+def test_current_run_is_null_when_no_run_is_active(client: TestClient):
+    response = client.get("/api/agent/runs/current")
+
+    assert response.status_code == 200
+    assert response.json() == {"run": None}
+
+
+def test_only_one_run_can_be_active_and_conflict_returns_run_id(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(main, "process_queue_run", lambda run_id: None)
+
+    first = client.post("/api/agent/runs", json={"max_claims": 2})
+    active = client.get("/api/agent/runs/current").json()["run"]
+    second = client.post("/api/agent/runs", json={"max_claims": 1})
+
+    assert first.status_code == 200
+    assert active["run_id"] == first.json()["run_id"]
+    assert len(active["todos"]) == 2
+    assert second.status_code == 409
+    assert second.json()["detail"]["run_id"] == first.json()["run_id"]
+    assert (
+        sum(
+            claim["status"] == "in progress"
+            for claim in client.get("/api/claims").json()["claims"]
+        )
+        == 2
+    )
+
+
+@pytest.mark.parametrize("max_claims", [0, -1, 26, "five", 1.5])
+def test_queue_run_rejects_invalid_caps(client: TestClient, max_claims: object):
+    response = client.post("/api/agent/runs", json={"max_claims": max_claims})
+
+    assert response.status_code == 422
+    assert client.get("/api/agent/runs/current").json() == {"run": None}
+
+
+def test_selection_rejects_invalid_sets_without_partial_state(client: TestClient):
+    run_id = "selection-run"
+    database.create_run(run_id, "queue", 1)
+
+    too_many = client.post(
+        f"/api/agent/runs/{run_id}/select", json={"claim_ids": ["CLM-1001", "CLM-1002"]}
+    )
+    duplicate = client.post(
+        f"/api/agent/runs/{run_id}/select", json={"claim_ids": ["CLM-1001", "CLM-1001"]}
+    )
+    database.set_claim_status("CLM-1002", "decided")
+    not_waiting = client.post(
+        f"/api/agent/runs/{run_id}/select", json={"claim_ids": ["CLM-1002"]}
+    )
+    queue = client.get("/api/claims").json()["claims"]
+    run = client.get(f"/api/agent/runs/{run_id}").json()
+
+    assert too_many.status_code == 422
+    assert duplicate.status_code == 422
+    assert not_waiting.status_code == 409
+    assert {claim["claim_id"]: claim["status"] for claim in queue}[
+        "CLM-1001"
+    ] == "waiting"
+    assert run["todos"] == []
+
+
+def test_simultaneous_acquisitions_have_one_winner(client: TestClient):
+    run_id = "concurrent-run"
+    database.create_run(run_id, "queue", 1)
+    barrier = Barrier(2)
+
+    def acquire() -> bool:
+        barrier.wait()
+        try:
+            database.select_run_claims(run_id, ["CLM-1001"])
+        except ValueError:
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: acquire(), range(2)))
+
+    assert results.count(True) == 1
+    assert results.count(False) == 1
+    claim = database.get_claim_record("CLM-1001")
+    assert claim is not None
+    assert claim["status"] == "in progress"
+    assert claim["run_id"] == run_id
+    assert len(database.get_run(run_id)["todos"]) == 1
+
+
+def test_run_todo_plan_requires_the_selected_claims(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(main, "process_queue_run", lambda run_id: None)
+    run_response = client.post("/api/agent/runs", json={"max_claims": 2})
+    run_id = run_response.json()["run_id"]
+    run = client.get("/api/agent/runs/current").json()["run"]
+    selected = [item["claim_id"] for item in run["todos"]]
+
+    valid = client.put(
+        f"/api/agent/runs/{run_id}/todos",
+        json={
+            "items": [
+                {"claim_id": selected[1], "description": "Review second claim"},
+                {"claim_id": selected[0], "description": "Review first claim"},
+            ]
+        },
+    )
+    invalid = client.put(
+        f"/api/agent/runs/{run_id}/todos",
+        json={"items": [{"claim_id": "CLM-9999", "description": "Other claim"}]},
+    )
+    planned = client.get("/api/agent/runs/current").json()["run"]["todos"]
+
+    assert valid.status_code == 200
+    assert invalid.status_code == 422
+    assert [item["claim_id"] for item in planned] == list(reversed(selected))
+
+
+def test_todo_statuses_are_persisted_and_invalid_status_is_rejected(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(main, "process_queue_run", lambda run_id: None)
+    response = client.post("/api/agent/runs", json={"max_claims": 1})
+    run_id = response.json()["run_id"]
+    run = client.get("/api/agent/runs/current").json()["run"]
+    todo_id = run["todos"][0]["todo_id"]
+
+    for status in ("to do", "in progress", "done", "left for handler"):
+        update = client.patch(
+            f"/api/agent/runs/{run_id}/todos/{todo_id}", json={"status": status}
+        )
+        assert update.status_code == 200
+        assert (
+            client.get("/api/agent/runs/current").json()["run"]["todos"][0]["status"]
+            == status
+        )
+
+    invalid_state = client.patch(
+        f"/api/agent/runs/{run_id}/todos/{todo_id}", json={"status": "blocked"}
+    )
+    wrong_run = client.patch(
+        f"/api/agent/runs/unknown/todos/{todo_id}", json={"status": "done"}
+    )
+
+    assert invalid_state.status_code == 422
+    assert wrong_run.status_code == 404
+
+
+def test_needs_handler_claim_appears_in_queue(client: TestClient):
+    database.set_claim_status("CLM-1001", "needs handler")
+
+    response = client.get("/api/claims")
+    claims = {claim["claim_id"]: claim for claim in response.json()["claims"]}
+
+    assert claims["CLM-1001"]["status"] == "needs handler"
+
+
+def test_decision_signoff_and_payment_writes_are_idempotent(client: TestClient):
+    stored_decision = decision()
+
+    database.save_decision("CLM-1001", stored_decision, "waiting for sign-off")
+    database.save_decision("CLM-1001", stored_decision, "waiting for sign-off")
+    database.sign_off_claim("CLM-1001", "HND-01")
+    database.sign_off_claim("CLM-1001", "HND-01")
+    database.save_payment("CLM-1001", 0.0)
+    database.save_payment("CLM-1001", 0.0)
+
+    with database.connection() as db:
+        decision_count = db.execute(
+            "SELECT COUNT(*) FROM decisions WHERE claim_id = 'CLM-1001'"
+        ).fetchone()[0]
+        signoff_count = db.execute(
+            "SELECT COUNT(*) FROM signoffs WHERE claim_id = 'CLM-1001'"
+        ).fetchone()[0]
+        payment_count = db.execute(
+            "SELECT COUNT(*) FROM payments WHERE claim_id = 'CLM-1001'"
+        ).fetchone()[0]
+
+    assert decision_count == 1
+    assert signoff_count == 1
+    assert payment_count == 1
+
+
+def test_named_claim_creates_a_one_item_run(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(main, "process_queue_run", lambda run_id: None)
+
+    response = client.post("/api/claims/CLM-1001/run")
+    run = client.get("/api/agent/runs/current").json()["run"]
+
+    assert response.json() == {"status": "in progress"}
+    assert run["run_type"] == "claim"
+    assert run["max_claims"] == 1
+    assert [item["claim_id"] for item in run["todos"]] == ["CLM-1001"]
+    assert run["todos"][0]["status"] == "to do"
+
+
+def test_initialize_deduplicates_old_decisions_and_adds_unique_constraints(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    path = tmp_path / "pilot.sqlite3"
+    monkeypatch.setattr(database, "DATABASE_PATH", path)
+    first_decision = decision("Keep the earliest record.")
+    duplicate_decision = decision("Remove the later duplicate.")
+    other_decision = decision("Keep the other claim's decision.")
+    claims = database.read_json("claims.json")
+    policies = {row["policy_id"]: row for row in database.read_json("policies.json")}
+    customers = {
+        row["customer_id"]: row for row in database.read_json("customers.json")
+    }
+    with sqlite3.connect(path) as db:
+        db.executescript(
+            """
+            CREATE TABLE claims (
+                claim_id TEXT PRIMARY KEY,
+                policy_id TEXT NOT NULL,
+                customer_id TEXT NOT NULL,
+                source_json TEXT NOT NULL,
+                policy_json TEXT NOT NULL,
+                customer_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'waiting',
+                decision_json TEXT,
+                sign_off_handler_id TEXT,
+                payment_json TEXT
+            );
+            CREATE TABLE events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                claim_id TEXT NOT NULL,
+                step TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE decisions (
+                decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                claim_id TEXT NOT NULL,
+                decision_json TEXT NOT NULL
+            );
+            CREATE TABLE payments (
+                payment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                claim_id TEXT NOT NULL,
+                payment_json TEXT NOT NULL
+            );
+            """
+        )
+        for claim in claims:
+            decision_json = (
+                json.dumps(duplicate_decision)
+                if claim["claim_id"] == "CLM-1001"
+                else json.dumps(other_decision)
+                if claim["claim_id"] == "CLM-1002"
+                else None
+            )
+            db.execute(
+                "INSERT INTO claims VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    claim["claim_id"],
+                    claim["policy_id"],
+                    claim["customer_id"],
+                    json.dumps(claim),
+                    json.dumps(policies[claim["policy_id"]]),
+                    json.dumps(customers[claim["customer_id"]]),
+                    "decided" if decision_json is not None else "waiting",
+                    decision_json,
+                    None,
+                    None,
+                ),
+            )
+        db.executemany(
+            "INSERT INTO decisions (claim_id, decision_json) VALUES (?, ?)",
+            [
+                ("CLM-1001", json.dumps(first_decision)),
+                ("CLM-1001", json.dumps(duplicate_decision)),
+                ("CLM-1002", json.dumps(other_decision)),
+            ],
+        )
+        db.executemany(
+            "INSERT INTO payments (claim_id, payment_json) VALUES (?, ?)",
+            [
+                (
+                    "CLM-1003",
+                    json.dumps({"amount_inr": 100.0, "simulated": True}),
+                ),
+                (
+                    "CLM-1003",
+                    json.dumps({"amount_inr": 200.0, "simulated": True}),
+                ),
+            ],
+        )
+
+    database.initialize_database()
+    record = database.get_claim_record("CLM-1001")
+    events = database.list_events("CLM-1001")
+    with database.connection() as db:
+        decisions = db.execute("SELECT * FROM decisions").fetchall()
+        payments = db.execute("SELECT * FROM payments").fetchall()
+        indexes = {row["name"] for row in db.execute("PRAGMA index_list(decisions)")}
+        payment_indexes = {
+            row["name"] for row in db.execute("PRAGMA index_list(payments)")
+        }
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(
+                "INSERT INTO decisions (claim_id, decision_json, idempotency_key) "
+                "VALUES (?, ?, ?)",
+                ("CLM-1001", json.dumps(duplicate_decision), "duplicate-key"),
+            )
+        db.execute(
+            "INSERT INTO payments (claim_id, payment_json, idempotency_key) "
+            "VALUES (?, ?, ?)",
+            ("CLM-1001", "{}", "payment-one"),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(
+                "INSERT INTO payments (claim_id, payment_json, idempotency_key) "
+                "VALUES (?, ?, ?)",
+                ("CLM-1001", "{}", "payment-two"),
+            )
+
+    assert record is not None
+    assert record["decision"] == first_decision
+    assert len(database.list_claim_records()) == 25
+    assert len(decisions) == 2
+    assert len(payments) == 1
+    assert "decisions_claim_unique" in indexes
+    assert "decisions_key_unique" in indexes
+    assert "payments_claim_unique" in payment_indexes
+    assert "payments_key_unique" in payment_indexes
+    assert any(event["step"] == "Duplicate record removed" for event in events)

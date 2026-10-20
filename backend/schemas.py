@@ -54,3 +54,34 @@ class PaymentInput(BaseModel):
     """Exact INR amount to record as a simulated payment."""
 
     amount_inr: float = Field(ge=0)
+
+
+class RunStartInput(BaseModel):
+    """Maximum number of distinct waiting claims in a queue run."""
+
+    max_claims: int = Field(ge=1, le=25)
+
+
+class RunTodoItemInput(BaseModel):
+    """One claim and description in the queue agent's work plan."""
+
+    claim_id: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+
+
+class RunTodoPlanInput(BaseModel):
+    """Ordered queue agent work items for one run."""
+
+    items: list[RunTodoItemInput]
+
+
+class RunSelectionInput(BaseModel):
+    """Claim identifiers reserved for a run in the requested order."""
+
+    claim_ids: list[str]
+
+
+class RunTodoStatusInput(BaseModel):
+    """Allowed state for one queue run work item."""
+
+    status: Literal["to do", "in progress", "done", "left for handler"]

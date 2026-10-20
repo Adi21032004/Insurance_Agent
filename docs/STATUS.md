@@ -2,6 +2,8 @@
 
 The pilot is complete. All five phases are complete.
 
+The harness implementation is in progress. Phase 1 of 6 is complete: SQLite now persists capped runs, reserved claims, ordered to-do items and summaries. Only one run can be active. Claim reservation is atomic, and repeated decision, sign-off and payment writes are idempotent with unique database records. Pilot databases migrate duplicate decision and payment rows by retaining the earliest and recording the removal in claim activity.
+
 - `backend/`: SQLite seeds the 25 queue claims from approved business data files; read APIs return the queue and full claim context in INR. The company setting `usd_to_inr_rate` drives amount conversion and the sign-off threshold. The API records progress and policy decisions, calculates payouts from selected source items, enforces handler sign-off, and records simulated payments.
 - `agent/`: `run(claim_id, thread_id)` uses LangChain `create_agent` with the configured OpenRouter model. It reads claim data, policy wording and its instructions through backend APIs, records progress and decisions, requests backend payout calculations, and uses the guarded simulated payment operation.
 - `dashboard/`: the handler workspace shows the 25-claim queue, claim evidence and policy context, INR amounts, agent decision and progress, read-only instructions, handler sign-off and simulated payment controls.
