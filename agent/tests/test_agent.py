@@ -23,15 +23,36 @@ def use_test_database(monkeypatch, tmp_path):
 
 def test_agent_tools_read_claim_and_policy_through_backend(monkeypatch, tmp_path):
     use_test_database(monkeypatch, tmp_path)
+    with TestClient(app):
+        database.set_claim_status("CLM-1001", "in progress")
     monkeypatch.setattr(main, "backend", lambda: TestClient(app))
 
     claim = json.loads(main.get_claim_context.invoke({"claim_id": "CLM-1001"}))
-    wording = main.get_policy_wording.invoke({})
+    matches = json.loads(
+        main.search_claim_knowledge.invoke(
+            {
+                "claim_id": "CLM-1001",
+                "source": "policy_wording",
+                "query": "Trip Delay",
+            }
+        )
+    )
+    section = json.loads(
+        main.read_claim_section.invoke(
+            {
+                "claim_id": "CLM-1001",
+                "source": "policy_wording",
+                "section_id": "policy_wording:03",
+            }
+        )
+    )
 
     assert claim["claim"]["amount_claimed_inr"] == 34860.0
     assert claim["customer"]["name"] == "Maya Patel"
-    assert "Trip Delay" in wording
-    assert "$" not in wording
+    assert "policy_wording" not in claim
+    assert any(match["section_id"] == "policy_wording:03" for match in matches)
+    assert "mechanical or crew problem" in section["content"]
+    assert "$" not in section["content"]
 
 
 def test_agent_has_no_direct_seed_data_dependency():
@@ -56,12 +77,16 @@ def test_run_uses_instructions_api_and_records_decision(monkeypatch, tmp_path):
     assert record is not None
     assert record["decision"]["policy_section"] == "Section 3: Trip Delay"
     assert record["decision"]["payout_inr"] == 34860.0
+    assert record["decision"]["manual_version"] == "2026.2"
+    assert {item["source"] for item in record["decision"]["sections_read"]} == {
+        "claims_manual",
+        "policy_wording",
+    }
     assert record["payment"] == {"amount_inr": 34860.0, "simulated": True}
-    assert [event["step"] for event in database.list_events("CLM-1001")] == [
-        "Review claim",
-        "Decision recorded",
-        "Simulated payment recorded",
-    ]
+    assert "Source section read" in {
+        event["step"] for event in database.list_events("CLM-1001")
+    }
+    assert len(database.list_source_reads("CLM-1001")) == 2
 
 
 def test_agent_records_decline_with_policy_evidence(monkeypatch, tmp_path):
@@ -73,11 +98,46 @@ def test_agent_records_decline_with_policy_evidence(monkeypatch, tmp_path):
     messages = iter(
         [
             tool_message("get_claim_context", {"claim_id": "CLM-1001"}, "1"),
-            tool_message("get_policy_wording", {}, "2"),
+            tool_message(
+                "search_claim_knowledge",
+                {
+                    "claim_id": "CLM-1001",
+                    "source": "policy_wording",
+                    "query": "general exclusions",
+                },
+                "2",
+            ),
+            tool_message(
+                "read_claim_section",
+                {
+                    "claim_id": "CLM-1001",
+                    "source": "policy_wording",
+                    "section_id": "policy_wording:09",
+                },
+                "3",
+            ),
+            tool_message(
+                "search_claim_knowledge",
+                {
+                    "claim_id": "CLM-1001",
+                    "source": "claims_manual",
+                    "query": "conflicting documents investigation",
+                },
+                "4",
+            ),
+            tool_message(
+                "read_claim_section",
+                {
+                    "claim_id": "CLM-1001",
+                    "source": "claims_manual",
+                    "section_id": "claims_manual:08",
+                },
+                "5",
+            ),
             tool_message(
                 "record_claim_progress",
                 {"claim_id": "CLM-1001", "step": "Evidence", "detail": "Reviewing."},
-                "3",
+                "6",
             ),
             tool_message(
                 "record_claim_decision",
@@ -93,7 +153,7 @@ def test_agent_records_decline_with_policy_evidence(monkeypatch, tmp_path):
                     "items": [],
                     "paid_by_others_inr": 0,
                 },
-                "4",
+                "7",
             ),
             AIMessage(content="Declined under Section 9: General Exclusions."),
         ]

@@ -42,7 +42,42 @@ def stub_model(claim_id: str) -> StubModel:
     messages: Iterator[AIMessage] = iter(
         [
             tool_message("get_claim_context", {"claim_id": claim_id}, "1"),
-            tool_message("get_policy_wording", {}, "2"),
+            tool_message(
+                "search_claim_knowledge",
+                {
+                    "claim_id": claim_id,
+                    "source": "policy_wording",
+                    "query": "trip delay waiting period expenses",
+                },
+                "2",
+            ),
+            tool_message(
+                "read_claim_section",
+                {
+                    "claim_id": claim_id,
+                    "source": "policy_wording",
+                    "section_id": "policy_wording:03",
+                },
+                "3",
+            ),
+            tool_message(
+                "search_claim_knowledge",
+                {
+                    "claim_id": claim_id,
+                    "source": "claims_manual",
+                    "query": "trip delay accommodation meals receipts",
+                },
+                "4",
+            ),
+            tool_message(
+                "read_claim_section",
+                {
+                    "claim_id": claim_id,
+                    "source": "claims_manual",
+                    "section_id": "claims_manual:07",
+                },
+                "5",
+            ),
             tool_message(
                 "record_claim_progress",
                 {
@@ -50,14 +85,14 @@ def stub_model(claim_id: str) -> StubModel:
                     "step": "Review claim",
                     "detail": "Checking the story, policy and supporting documents.",
                 },
-                "3",
+                "6",
             ),
-            tool_message("calculate_claim_payout", payout_request, "4"),
-            tool_message("record_claim_decision", decision_request, "5"),
+            tool_message("calculate_claim_payout", payout_request, "7"),
+            tool_message("record_claim_decision", decision_request, "8"),
             tool_message(
                 "pay_claim",
                 {"claim_id": claim_id, "amount_inr": 34860.0},
-                "6",
+                "9",
             ),
             AIMessage(
                 content=(
@@ -90,7 +125,42 @@ def stub_over_limit_model(claim_id: str) -> StubModel:
     messages: Iterator[AIMessage] = iter(
         [
             tool_message("get_claim_context", {"claim_id": claim_id}, "1"),
-            tool_message("get_policy_wording", {}, "2"),
+            tool_message(
+                "search_claim_knowledge",
+                {
+                    "claim_id": claim_id,
+                    "source": "policy_wording",
+                    "query": "emergency medical benefit",
+                },
+                "2",
+            ),
+            tool_message(
+                "read_claim_section",
+                {
+                    "claim_id": claim_id,
+                    "source": "policy_wording",
+                    "section_id": "policy_wording:07",
+                },
+                "3",
+            ),
+            tool_message(
+                "search_claim_knowledge",
+                {
+                    "claim_id": claim_id,
+                    "source": "claims_manual",
+                    "query": "medical records pre-existing condition",
+                },
+                "4",
+            ),
+            tool_message(
+                "read_claim_section",
+                {
+                    "claim_id": claim_id,
+                    "source": "claims_manual",
+                    "section_id": "claims_manual:07",
+                },
+                "5",
+            ),
             tool_message(
                 "record_claim_progress",
                 {
@@ -98,14 +168,14 @@ def stub_over_limit_model(claim_id: str) -> StubModel:
                     "step": "Review claim",
                     "detail": "Checking the medical report and policy terms.",
                 },
-                "3",
+                "6",
             ),
-            tool_message("calculate_claim_payout", payout_request, "4"),
-            tool_message("record_claim_decision", decision_request, "5"),
+            tool_message("calculate_claim_payout", payout_request, "7"),
+            tool_message("record_claim_decision", decision_request, "8"),
             tool_message(
                 "pay_claim",
                 {"claim_id": claim_id, "amount_inr": 311250.0},
-                "6",
+                "9",
             ),
             AIMessage(
                 content=(
@@ -123,7 +193,42 @@ def stub_refer_model(claim_id: str) -> StubModel:
     messages: Iterator[AIMessage] = iter(
         [
             tool_message("get_claim_context", {"claim_id": claim_id}, "1"),
-            tool_message("get_policy_wording", {}, "2"),
+            tool_message(
+                "search_claim_knowledge",
+                {
+                    "claim_id": claim_id,
+                    "source": "policy_wording",
+                    "query": "baggage theft reporting evidence",
+                },
+                "2",
+            ),
+            tool_message(
+                "read_claim_section",
+                {
+                    "claim_id": claim_id,
+                    "source": "policy_wording",
+                    "section_id": "policy_wording:05",
+                },
+                "3",
+            ),
+            tool_message(
+                "search_claim_knowledge",
+                {
+                    "claim_id": claim_id,
+                    "source": "claims_manual",
+                    "query": "missing carrier report required documents",
+                },
+                "4",
+            ),
+            tool_message(
+                "read_claim_section",
+                {
+                    "claim_id": claim_id,
+                    "source": "claims_manual",
+                    "section_id": "claims_manual:05",
+                },
+                "5",
+            ),
             tool_message(
                 "record_claim_progress",
                 {
@@ -131,7 +236,7 @@ def stub_refer_model(claim_id: str) -> StubModel:
                     "step": "Review claim",
                     "detail": "Checking the loss evidence and policy requirements.",
                 },
-                "3",
+                "6",
             ),
             tool_message(
                 "record_claim_decision",
@@ -147,7 +252,7 @@ def stub_refer_model(claim_id: str) -> StubModel:
                     "items": [],
                     "paid_by_others_inr": 0,
                 },
-                "4",
+                "7",
             ),
             AIMessage(content="Referred for review under Section 5: Baggage."),
         ]

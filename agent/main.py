@@ -58,12 +58,33 @@ def get_claim_context(claim_id: str) -> str:
 
 
 @tool
-def get_policy_wording() -> str:
-    """Read the policy wording from the backend in Indian rupees."""
+def search_claim_knowledge(
+    claim_id: str, source: Literal["policy_wording", "claims_manual"], query: str
+) -> str:
+    """Find relevant sections in the policy wording or claims manual."""
     with backend() as client:
-        response = client.get("/api/policy-wording")
+        response = client.post(
+            "/api/agent/knowledge/search",
+            json={"claim_id": claim_id, "source": source, "query": query},
+        )
     response.raise_for_status()
-    return response.json()["policy_wording"]
+    return json.dumps(response.json()["results"])
+
+
+@tool
+def read_claim_section(
+    claim_id: str,
+    source: Literal["policy_wording", "claims_manual"],
+    section_id: str,
+) -> str:
+    """Read one relevant source section and record it on the claim."""
+    with backend() as client:
+        response = client.post(
+            "/api/agent/knowledge/read",
+            json={"claim_id": claim_id, "source": source, "section_id": section_id},
+        )
+    response.raise_for_status()
+    return json.dumps(response.json())
 
 
 @tool
@@ -150,14 +171,17 @@ def run(claim_id: str, thread_id: str) -> str:
     response.raise_for_status()
     tools = [
         get_claim_context,
-        get_policy_wording,
+        search_claim_knowledge,
+        read_claim_section,
         record_claim_progress,
         calculate_claim_payout,
         record_claim_decision,
         pay_claim,
     ]
     agent = create_agent(
-        model(claim_id), tools=tools, system_prompt=response.json()["instructions"]
+        model(claim_id),
+        tools=tools,
+        system_prompt=response.json()["claim_instructions"],
     )
     result = agent.invoke(
         {"messages": [{"role": "user", "content": f"Review claim {claim_id}."}]},

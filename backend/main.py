@@ -6,9 +6,10 @@ from uuid import uuid4
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 
-from agent.instructions import SYSTEM_PROMPT
+from agent.instructions import CLAIM_INSTRUCTIONS, QUEUE_INSTRUCTIONS
 from agent.main import run as run_agent
 from backend import database
+from backend.knowledge import read_section, search_sections, split_sections
 from backend.money import (
     converted_claim,
     converted_company,
@@ -21,6 +22,8 @@ from backend.money import (
 from backend.payout import calculate
 from backend.schemas import (
     DecisionInput,
+    KnowledgeReadInput,
+    KnowledgeSearchInput,
     PaymentInput,
     PayoutInput,
     ProgressInput,
@@ -69,7 +72,20 @@ def claim_payload(record: dict[str, Any]) -> dict[str, Any]:
         "sign_off_handler_id": record["sign_off_handler_id"],
         "payment": record["payment"],
         "progress": database.list_events(record["claim"]["claim_id"]),
+        "source_reads": database.list_source_reads(record["claim"]["claim_id"]),
     }
+
+
+def agent_claim_payload(record: dict[str, Any]) -> dict[str, Any]:
+    """Build agent context without handing over either full source document."""
+    payload = claim_payload(record)
+    del payload["policy_wording"]
+    return payload
+
+
+def knowledge_document(source: str) -> str:
+    """Return one approved knowledge source from backend storage."""
+    return database.get_setting(source)
 
 
 def claim_or_404(claim_id: str) -> dict[str, Any]:
@@ -218,13 +234,51 @@ def get_claim(claim_id: str) -> dict[str, Any]:
 @app.get("/api/agent/claims/{claim_id}", operation_id="get_agent_claim")
 def get_agent_claim(claim_id: str) -> dict[str, Any]:
     """Return the claim context used by the agent."""
-    return claim_payload(claim_or_404(claim_id))
+    return agent_claim_payload(claim_or_404(claim_id))
 
 
 @app.get("/api/instructions", operation_id="get_instructions")
 def get_instructions() -> dict[str, str]:
-    """Return the read-only UnderCover Agent instructions."""
-    return {"instructions": SYSTEM_PROMPT}
+    """Return the read-only queue and claim agent instructions."""
+    return {
+        "queue_instructions": QUEUE_INSTRUCTIONS,
+        "claim_instructions": CLAIM_INSTRUCTIONS,
+    }
+
+
+@app.post("/api/agent/knowledge/search", operation_id="search_knowledge")
+def search_knowledge(request: KnowledgeSearchInput) -> dict[str, Any]:
+    """Search the requested policy or manual for claim-relevant sections."""
+    record = claim_or_404(request.claim_id)
+    require_in_progress(record)
+    rate = database.get_setting("company")["usd_to_inr_rate"]
+    results = search_sections(
+        request.source, knowledge_document(request.source), request.query, rate
+    )
+    return {"results": results}
+
+
+@app.post("/api/agent/knowledge/read", operation_id="read_knowledge_section")
+def read_knowledge_section(request: KnowledgeReadInput) -> dict[str, str]:
+    """Read and record one requested policy or manual section."""
+    record = claim_or_404(request.claim_id)
+    require_in_progress(record)
+    rate = database.get_setting("company")["usd_to_inr_rate"]
+    section = read_section(
+        request.source,
+        knowledge_document(request.source),
+        request.section_id,
+        rate,
+    )
+    if section is None:
+        raise HTTPException(status_code=404, detail="Knowledge section not found")
+    database.record_source_read(request.claim_id, section)
+    database.add_event(
+        request.claim_id,
+        "Source section read",
+        f"{section['source']}: {section['heading']}",
+    )
+    return section
 
 
 @app.post("/api/agent/runs", operation_id="start_queue_run")
@@ -359,6 +413,18 @@ def record_claim_decision(claim_id: str, request: DecisionInput) -> dict[str, An
         "outcome": request.outcome,
         "reason": request.reason,
         "policy_section": request.policy_section,
+        "manual_version": split_sections(
+            "claims_manual", knowledge_document("claims_manual")
+        )[0]["version"],
+        "sections_read": [
+            {
+                "source": source_read["source"],
+                "section_id": source_read["section_id"],
+                "heading": source_read["heading"],
+                "version": source_read["version"],
+            }
+            for source_read in database.list_source_reads(claim_id)
+        ],
         **payout,
     }
     status = "waiting for sign-off" if payout["needs_sign_off"] else "decided"

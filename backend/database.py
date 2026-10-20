@@ -192,6 +192,7 @@ def initialize_database() -> None:
         "handlers": read_json("handlers.json"),
         "company": read_json("company.json"),
         "policy_wording": (DATA_DIR / "policy_wording.md").read_text(encoding="utf-8"),
+        "claims_manual": (DATA_DIR / "claims_manual.md").read_text(encoding="utf-8"),
     }
 
     with connection() as db:
@@ -242,6 +243,17 @@ def initialize_database() -> None:
                 status TEXT NOT NULL DEFAULT 'to do',
                 UNIQUE(run_id, position),
                 UNIQUE(run_id, claim_id)
+            );
+            CREATE TABLE IF NOT EXISTS source_reads (
+                read_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                claim_id TEXT NOT NULL REFERENCES claims(claim_id),
+                source TEXT NOT NULL,
+                section_id TEXT NOT NULL,
+                heading TEXT NOT NULL,
+                version TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(claim_id, source, section_id)
             );
             CREATE TABLE IF NOT EXISTS decisions (
                 decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -402,6 +414,35 @@ def list_events(claim_id: str) -> list[dict[str, Any]]:
         rows = db.execute(
             "SELECT step, detail, created_at FROM events "
             "WHERE claim_id = ? ORDER BY event_id",
+            (claim_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def record_source_read(claim_id: str, section: dict[str, str]) -> None:
+    """Persist the first read of a knowledge section for a claim."""
+    with connection() as db:
+        db.execute(
+            "INSERT OR IGNORE INTO source_reads "
+            "(claim_id, source, section_id, heading, version, content) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                claim_id,
+                section["source"],
+                section["section_id"],
+                section["heading"],
+                section["version"],
+                section["content"],
+            ),
+        )
+
+
+def list_source_reads(claim_id: str) -> list[dict[str, Any]]:
+    """Return the policy and manual sections read for one claim."""
+    with connection() as db:
+        rows = db.execute(
+            "SELECT source, section_id, heading, version, content, created_at "
+            "FROM source_reads WHERE claim_id = ? ORDER BY read_id",
             (claim_id,),
         ).fetchall()
     return [dict(row) for row in rows]

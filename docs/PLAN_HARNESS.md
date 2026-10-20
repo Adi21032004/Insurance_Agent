@@ -51,12 +51,12 @@ Seed the claims manual as an approved business document. Add backend search and 
 
 Success criteria:
 
-- [ ] `uv run pytest backend/tests/test_knowledge.py backend/tests/test_api.py -q --no-cov` passes for manual and wording search, section reads, section metadata, INR conversion, and unknown sections.
-- [ ] API calls can search and read a specific section of each document; the responses contain the source name and section heading, and do not return the complete manual or complete wording.
-- [ ] A manual section containing a dollar limit is returned with its amount converted to INR, while its section meaning and wording remain intact.
-- [ ] The claim API returns the policy and manual sections read for that claim, and `docs/SPEC.md` describes the manual as part of the decision process.
-- [ ] The instructions API returns distinct queue and claim instructions that tell the agent to use only backend lookups and never handler evaluation decisions.
-- [ ] `POST /api/agent/knowledge/search` returns section IDs, headings and excerpts for the requested source; `POST /api/agent/knowledge/read` returns only the requested section with its source, heading and version, and records the read on the claim. `GET /api/instructions` returns distinct queue and claim instructions.
+- [x] `uv run pytest backend/tests/test_knowledge.py backend/tests/test_api.py -q --no-cov` passes for manual and wording search, section reads, section metadata, INR conversion, and unknown sections.
+- [x] API calls can search and read a specific section of each document; the responses contain the source name and section heading, and do not return the complete manual or complete wording.
+- [x] A manual section containing a dollar limit is returned with its amount converted to INR, while its section meaning and wording remain intact.
+- [x] The claim API returns the policy and manual sections read for that claim, and `docs/SPEC.md` describes the manual as part of the decision process.
+- [x] The instructions API returns distinct queue and claim instructions that tell the agent to use only backend lookups and never handler evaluation decisions.
+- [x] `POST /api/agent/knowledge/search` returns section IDs, headings and excerpts for the requested source; `POST /api/agent/knowledge/read` returns only the requested section with its source, heading and version, and records the read on the claim. `GET /api/instructions` returns distinct queue and claim instructions.
 
 ## Phase 3: Build the queue agent and fresh claim helpers
 

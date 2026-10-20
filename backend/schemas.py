@@ -85,3 +85,19 @@ class RunTodoStatusInput(BaseModel):
     """Allowed state for one queue run work item."""
 
     status: Literal["to do", "in progress", "done", "left for handler"]
+
+
+class KnowledgeSearchInput(BaseModel):
+    """Source and query used to find relevant handling sections."""
+
+    claim_id: str = Field(min_length=1)
+    source: Literal["policy_wording", "claims_manual"]
+    query: str = Field(min_length=1)
+
+
+class KnowledgeReadInput(BaseModel):
+    """Claim and section identifier for one source read."""
+
+    claim_id: str = Field(min_length=1)
+    source: Literal["policy_wording", "claims_manual"]
+    section_id: str = Field(min_length=1)
