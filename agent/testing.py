@@ -1,9 +1,13 @@
 """Deterministic LangChain model used by automated tests and browser checks."""
 
+import os
 from collections.abc import Iterator
 
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage
+
+_TEST_FAILURE_ATTEMPTS: dict[str, int] = {}
+_MISSED_STUB_CLAIMS: set[str] = set()
 
 
 class StubModel(GenericFakeChatModel):
@@ -11,6 +15,35 @@ class StubModel(GenericFakeChatModel):
 
     def bind_tools(self, tools, **kwargs):
         return self
+
+
+def scheduled_stub_failure(claim_id: str) -> bool:
+    """Apply an optional deterministic failure plan in stub mode."""
+    plan = os.getenv("UNDERCOVER_TEST_FAILURE_PLAN", "")
+    modes = {
+        entry.split(":", maxsplit=1)[0]: entry.split(":", maxsplit=1)[1]
+        for entry in plan.split(",")
+        if ":" in entry
+    }
+    mode = modes.get(claim_id)
+    attempts = _TEST_FAILURE_ATTEMPTS.get(claim_id, 0)
+    _TEST_FAILURE_ATTEMPTS[claim_id] = attempts + 1
+    return mode == "always" or (mode == "once" and attempts == 0)
+
+
+def stub_provider_failure() -> StubModel:
+    """Return a deterministic model that fails before its first response."""
+    return StubModel(messages=iter(()))
+
+
+def scheduled_stub_miss(claim_id: str) -> bool:
+    """Skip one selected claim when a browser check requests reconciliation."""
+    if os.getenv("UNDERCOVER_TEST_MISSED_CLAIM") != claim_id:
+        return False
+    if claim_id in _MISSED_STUB_CLAIMS:
+        return False
+    _MISSED_STUB_CLAIMS.add(claim_id)
+    return True
 
 
 def tool_message(name: str, args: dict[str, object], call_id: str) -> AIMessage:

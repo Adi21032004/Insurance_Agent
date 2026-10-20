@@ -13,7 +13,15 @@ from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field, SecretStr
 
-from agent.testing import stub_model, stub_over_limit_model, stub_queue_model
+from agent.testing import (
+    scheduled_stub_failure,
+    scheduled_stub_miss,
+    stub_model,
+    stub_over_limit_model,
+    stub_provider_failure,
+    stub_queue_model,
+    stub_refer_model,
+)
 from backend.schemas import ItemSelection, RunTodoItemInput
 
 load_dotenv()
@@ -171,9 +179,21 @@ def model(claim_id: str | None = None) -> BaseChatModel:
     """Return the configured test model or the OpenRouter model."""
     if os.getenv("UNDERCOVER_AGENT_TEST_MODE") == "1":
         test_claim_id = claim_id or os.getenv("UNDERCOVER_TEST_CLAIM_ID", "CLM-1001")
+        if scheduled_stub_failure(test_claim_id):
+            return stub_provider_failure()
         if test_claim_id == "CLM-1003":
             return stub_over_limit_model(test_claim_id)
-        return stub_model(test_claim_id)
+        if test_claim_id == "CLM-1001":
+            return stub_model(test_claim_id)
+        test_benefits = {
+            "CLM-1002": "baggage",
+            "CLM-1004": "baggage_delay",
+            "CLM-1005": "passport",
+            "CLM-1007": "baggage",
+        }
+        return stub_refer_model(
+            test_claim_id, test_benefits.get(test_claim_id, "trip_delay")
+        )
     name = os.getenv("MODEL_NAME")
     return ChatOpenAI(
         model=name or DEFAULT_MODEL,
@@ -295,14 +315,11 @@ def process_run_todo(
     run_id: str, thread_id: str, todo: dict[str, Any]
 ) -> tuple[str | None, bool]:
     """Run one claim's attempts and return its outcome and handler state."""
-    if todo["status"] == "done":
-        return decision_outcome(todo["claim_id"]), False
-    if todo["status"] == "left for handler":
-        return None, True
-    attempt = int(todo["attempt_count"])
-    if todo["status"] != "in progress":
-        update_run_todo(run_id, todo["todo_id"], "in progress")
-        attempt += 1
+    state = claim_snapshot(todo["claim_id"])
+    is_terminal, outcome, needs_handler = reconcile_terminal_todo(run_id, todo, state)
+    if is_terminal:
+        return outcome, needs_handler
+    attempt = start_todo_attempt(run_id, todo, state)
     while True:
         try:
             report = run_claim_helper(
@@ -334,6 +351,53 @@ def process_run_todo(
             )
 
 
+def reconcile_terminal_todo(
+    run_id: str, todo: dict[str, Any], state: dict[str, Any]
+) -> tuple[bool, str | None, bool]:
+    """Keep terminal work-item states aligned with persisted claim state."""
+    if state["status"] == "needs handler":
+        if todo["status"] != "left for handler":
+            update_run_todo(run_id, todo["todo_id"], "left for handler")
+        return True, None, True
+    outcome = completed_decision_outcome(state)
+    if outcome is not None:
+        if todo["status"] != "done":
+            update_run_todo(run_id, todo["todo_id"], "done")
+        return True, outcome, False
+    if todo["status"] in {"done", "left for handler"}:
+        update_run_todo(run_id, todo["todo_id"], "to do")
+    return False, None, False
+
+
+def completed_decision_outcome(state: dict[str, Any]) -> str | None:
+    """Return an outcome only when persisted decision work is complete."""
+    decision = state["decision"]
+    if decision is None:
+        return None
+    if decision["outcome"] != "approve":
+        return decision["outcome"]
+    if state["payment"] is not None:
+        return decision["outcome"]
+    if decision["needs_sign_off"] and state["sign_off_handler_id"] is None:
+        return decision["outcome"]
+    return None
+
+
+def start_todo_attempt(run_id: str, todo: dict[str, Any], state: dict[str, Any]) -> int:
+    """Acquire a pending selected claim before running its helper."""
+    attempt = int(todo["attempt_count"])
+    if todo["status"] == "in progress":
+        return attempt
+    if state["status"] == "waiting":
+        return retry_claim(
+            run_id,
+            todo["claim_id"],
+            "Reacquiring a selected claim during run reconciliation.",
+        )
+    update_run_todo(run_id, todo["todo_id"], "in progress")
+    return attempt + 1
+
+
 def run_queue(run_id: str, thread_id: str) -> str:
     """Plan a capped queue run and review each selected claim in a fresh agent."""
     run_record, waiting = load_run_context(run_id)
@@ -351,16 +415,26 @@ def run_queue(run_id: str, thread_id: str) -> str:
     outcomes = {"approve": 0, "decline": 0, "refer": 0}
     failed = 0
     for todo in run_record["todos"]:
+        if os.getenv("UNDERCOVER_AGENT_TEST_MODE") == "1" and scheduled_stub_miss(
+            todo["claim_id"]
+        ):
+            continue
         outcome, needs_handler = process_run_todo(run_id, thread_id, todo)
         if outcome is not None:
             outcomes[outcome] += 1
         failed += int(needs_handler)
 
-    summary = (
-        f"Reviewed {len(run_record['todos'])} claims: {outcomes['approve']} approved, "
-        f"{outcomes['decline']} declined, {outcomes['refer']} referred, "
-        f"{failed} need handler attention."
-    )
+    with backend() as client:
+        response = client.get(f"/api/agent/runs/{run_id}")
+    response.raise_for_status()
+    latest_run = response.json()
+    for todo in latest_run["todos"]:
+        if todo["status"] in {"done", "left for handler"}:
+            continue
+        outcome, needs_handler = process_run_todo(run_id, thread_id, todo)
+        if outcome is not None:
+            outcomes[outcome] += 1
+        failed += int(needs_handler)
     with backend() as client:
         response = client.get(f"/api/agent/runs/{run_id}")
     response.raise_for_status()
@@ -370,6 +444,11 @@ def run_queue(run_id: str, thread_id: str) -> str:
         for item in latest_run["todos"]
     ):
         raise RuntimeError("The run reconciliation found unfinished claims")
+    summary = (
+        f"Reviewed {len(latest_run['todos'])} claims: "
+        f"{outcomes['approve']} approved, {outcomes['decline']} declined, "
+        f"{outcomes['refer']} referred, {failed} need handler attention."
+    )
     with backend() as client:
         response = client.post(
             f"/api/agent/runs/{run_id}/complete", json={"summary": summary}

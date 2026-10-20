@@ -81,7 +81,9 @@ def test_exact_limit_payment_succeeds_without_signoff(
     assert paid.json()["amount_inr"] == 83000.0
 
 
-def test_payment_rejects_mismatch_unapproved_and_duplicate(client: TestClient):
+def test_payment_rejects_mismatch_and_unapproved_payment_and_replays_duplicate(
+    client: TestClient,
+):
     unapproved = client.post("/api/claims/CLM-1001/pay", json={"amount_inr": 1})
     start_claim(client, "CLM-1001")
     low_limit_body = {
@@ -101,7 +103,8 @@ def test_payment_rejects_mismatch_unapproved_and_duplicate(client: TestClient):
     assert unapproved.status_code == 409
     assert mismatch.status_code == 409
     assert paid.status_code == 200
-    assert duplicate.status_code == 409
+    assert duplicate.status_code == 200
+    assert duplicate.json() == paid.json()
 
 
 def test_only_a_known_handler_can_sign_off(

@@ -159,6 +159,53 @@ def test_queue_run_plans_order_and_uses_fresh_claim_helpers(monkeypatch, tmp_pat
         }
 
 
+def test_queue_reconciles_a_selected_claim_skipped_during_processing(
+    monkeypatch, tmp_path
+):
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(main, "backend", lambda: TestClient(app))
+    monkeypatch.setattr(backend_main, "process_queue_run", lambda run_id: None)
+    monkeypatch.setenv("UNDERCOVER_AGENT_TEST_MODE", "1")
+    with TestClient(app) as client:
+        run_id = client.post("/api/agent/runs", json={"max_claims": 3}).json()["run_id"]
+        waiting = [
+            claim["claim_id"]
+            for claim in client.get("/api/claims").json()["claims"]
+            if claim["status"] == "waiting"
+        ]
+    selected = list(reversed(waiting[:3]))
+    missed_claim = selected[0]
+    missed_once = False
+
+    def miss_selected_claim(claim_id):
+        nonlocal missed_once
+        if claim_id == missed_claim and not missed_once:
+            missed_once = True
+            return True
+        return False
+
+    def claim_model(claim_id: str | None = None):
+        assert claim_id is not None
+        record = database.get_claim_record(claim_id)
+        assert record is not None
+        return stub_refer_model(claim_id, record["claim"]["claim_type"])
+
+    monkeypatch.setattr(main, "scheduled_stub_miss", miss_selected_claim)
+    monkeypatch.setattr(main, "queue_model", stub_queue_model)
+    monkeypatch.setattr(main, "model", claim_model)
+
+    summary = main.run_queue(run_id, f"{run_id}-reconcile")
+
+    run = database.get_run(run_id)
+    assert run is not None
+    assert run["status"] == "completed"
+    assert [todo["claim_id"] for todo in run["todos"]] == selected
+    assert all(todo["status"] == "done" for todo in run["todos"])
+    assert run["todos"][0]["attempt_count"] == 1
+    assert "3 referred" in summary
+    assert missed_once
+
+
 def test_queue_retries_one_failed_claim_without_spending_another_slot(
     monkeypatch, tmp_path
 ):
@@ -177,7 +224,8 @@ def test_queue_retries_one_failed_claim_without_spending_another_slot(
     original_helper = main.run_claim_helper
     monkeypatch.setattr(main, "queue_model", stub_queue_model)
 
-    def claim_model(claim_id=None):
+    def claim_model(claim_id: str | None = None):
+        assert claim_id is not None
         record = database.get_claim_record(claim_id)
         assert record is not None
         return stub_refer_model(claim_id, record["claim"]["claim_type"])
@@ -234,7 +282,8 @@ def test_second_failure_routes_one_claim_to_handler_and_continues(
     failures = []
     monkeypatch.setattr(main, "queue_model", stub_queue_model)
 
-    def claim_model(claim_id=None):
+    def claim_model(claim_id: str | None = None):
+        assert claim_id is not None
         record = database.get_claim_record(claim_id)
         assert record is not None
         return stub_refer_model(claim_id, record["claim"]["claim_type"])
