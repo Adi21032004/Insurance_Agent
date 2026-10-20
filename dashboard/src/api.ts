@@ -1,5 +1,12 @@
 export type ClaimStatus =
-  "waiting" | "in progress" | "waiting for sign-off" | "decided";
+  | "waiting"
+  | "in progress"
+  | "waiting for sign-off"
+  | "decided"
+  | "needs handler";
+
+export type RunTodoStatus =
+  "to do" | "in progress" | "done" | "left for handler";
 
 export type DecisionOutcome = "approve" | "decline" | "refer";
 
@@ -15,6 +22,13 @@ export interface Decision {
   calculation: CalculationStep[];
   payout_inr: number;
   needs_sign_off: boolean;
+  manual_version?: string;
+  sections_read?: {
+    source: string;
+    section_id: string;
+    heading: string;
+    version: string;
+  }[];
 }
 
 export interface ClaimSummary {
@@ -137,15 +151,56 @@ export interface ClaimDetail {
   decision: Decision | null;
   sign_off_handler_id: string | null;
   payment: PaymentRecord | null;
+  failure_count: number;
   progress: ProgressEvent[];
+  source_reads: SourceRead[];
+}
+
+export interface SourceRead {
+  source: "policy_wording" | "claims_manual";
+  section_id: string;
+  heading: string;
+  version: string;
+  content: string;
+  created_at: string;
+}
+
+export interface RunTodo {
+  todo_id: number;
+  position: number;
+  claim_id: string;
+  description: string;
+  status: RunTodoStatus;
+  attempt_count: number;
+}
+
+export interface AgentRun {
+  run_id: string;
+  run_type: "queue" | "claim" | "recovery";
+  max_claims: number;
+  status: "in progress" | "completed" | "interrupted";
+  summary: string | null;
+  todos: RunTodo[];
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
   if (!response.ok) {
-    const body = (await response.json()) as { detail?: string };
+    const body = (await response.json()) as { detail?: unknown };
+    const detail = body.detail;
+    let message: string | undefined;
+    if (typeof detail === "string") {
+      message = detail;
+    } else if (
+      typeof detail === "object" &&
+      detail !== null &&
+      "message" in detail &&
+      typeof detail.message === "string"
+    ) {
+      message = detail.message;
+    }
     throw new Error(
-      body.detail ?? `Request failed with ${response.status.toString()}`,
+      message ?? `Request failed with ${response.status.toString()}`,
     );
   }
   return (await response.json()) as T;
@@ -159,11 +214,34 @@ export function getClaim(claimId: string): Promise<ClaimDetail> {
   return request(`/api/claims/${claimId}`);
 }
 
-export function getInstructions(): Promise<{ instructions: string }> {
+export function getInstructions(): Promise<{
+  queue_instructions: string;
+  claim_instructions: string;
+}> {
   return request("/api/instructions");
 }
 
-export function startClaim(claimId: string): Promise<{ status: ClaimStatus }> {
+export function getCurrentRun(): Promise<{ run: AgentRun | null }> {
+  return request("/api/agent/runs/current");
+}
+
+export function getRun(runId: string): Promise<AgentRun> {
+  return request(`/api/agent/runs/${runId}`);
+}
+
+export function startQueueRun(
+  maxClaims: number,
+): Promise<{ run_id: string; status: string; max_claims: number }> {
+  return request("/api/agent/runs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ max_claims: maxClaims }),
+  });
+}
+
+export function startClaim(
+  claimId: string,
+): Promise<{ status: ClaimStatus; run_id: string }> {
   return request(`/api/claims/${claimId}/run`, { method: "POST" });
 }
 

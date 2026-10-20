@@ -463,7 +463,7 @@ def start_claim(claim_id: str, background_tasks: BackgroundTasks) -> dict[str, s
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     background_tasks.add_task(process_queue_run, run_id)
-    return {"status": "in progress"}
+    return {"status": "in progress", "run_id": run_id}
 
 
 @app.post("/api/claims/{claim_id}/progress", operation_id="record_claim_progress")

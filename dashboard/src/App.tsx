@@ -1,6 +1,7 @@
 import { ClaimQueue } from "./components/ClaimQueue";
 import { ClaimWorkspace } from "./components/ClaimWorkspace";
 import { InstructionsPage } from "./components/InstructionsPage";
+import { RunProgress } from "./components/RunProgress";
 import "./App.css";
 import { useClaimsDesk } from "./useClaimsDesk";
 
@@ -60,10 +61,16 @@ export function App() {
         <div className="desk-layout">
           <ClaimQueue
             claims={desk.claims}
+            maxClaims={desk.maxClaims}
+            runBusy={desk.actionBusy}
+            runActive={desk.run?.status === "in progress"}
             selectedClaimId={desk.selectedClaimId}
+            onMaxClaimsChange={desk.setMaxClaims}
+            onStartQueueRun={desk.handleQueueRun}
             onSelect={desk.setSelectedClaimId}
           />
           <section className="detail-panel" aria-label="Claim details">
+            <RunProgress run={desk.run} />
             {desk.detail === null ? (
               <div className="card loading-card">
                 <p>

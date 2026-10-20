@@ -1,211 +1,16 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { App } from "./App";
-import type {
-  ClaimDetail,
-  ClaimStatus,
-  ClaimSummary,
-  Decision,
-  ProgressEvent,
-} from "./api";
-
-const approvedDecision: Decision = {
-  outcome: "approve",
-  reason:
-    "The carrier confirms a covered delay. The receipts support the expenses.",
-  policy_section: "Section 3: Trip Delay",
-  calculation: [{ step: "Hotel and meals", amount_inr: 34860 }],
-  payout_inr: 34860,
-  needs_sign_off: false,
-};
-
-const progressEvent: ProgressEvent = {
-  step: "Review claim",
-  detail: "Checking the story and receipts.",
-  created_at: "2026-10-17 10:00:00",
-};
-
-function makeSummary(
-  status: ClaimStatus = "waiting",
-  decision: Decision | null = null,
-): ClaimSummary {
-  return {
-    claim_id: "CLM-1001",
-    claim_type: "trip_delay",
-    summary: "Flight home canceled by the airline",
-    amount_claimed_inr: 34860,
-    status,
-    decision,
-  };
-}
-
-function makeDetail(
-  status: ClaimStatus = "waiting",
-  decision: Decision | null = null,
-  signOffHandlerId: string | null = null,
-  payment: ClaimDetail["payment"] = null,
-  progress: ProgressEvent[] = [],
-): ClaimDetail {
-  return {
-    claim: {
-      claim_id: "CLM-1001",
-      policy_id: "POL-2001",
-      customer_id: "CUS-3001",
-      claim_type: "trip_delay",
-      submitted_on: "2026-06-24",
-      incident_date: "2026-06-18",
-      incident_location: "Rome, Italy",
-      summary: "Flight home canceled by the airline",
-      story: "My flight home was canceled because of a crew problem.",
-      items: [
-        {
-          description: "Airport hotel",
-          category: "accommodation",
-          amount_inr: 20335,
-        },
-        {
-          description: "Dinner and breakfast",
-          category: "meals",
-          amount_inr: 7885,
-        },
-      ],
-      amount_claimed_inr: 34860,
-      documents: [
-        {
-          name: "Carrier cancellation notice",
-          type: "carrier_report",
-          content: "The flight was canceled because of crew availability.",
-        },
-      ],
-    },
-    policy: {
-      policy_id: "POL-2001",
-      plan: "premium",
-      add_ons: [],
-      purchased_on: "2026-04-22",
-      trip: {
-        destination: "Rome, Italy",
-        departs_on: "2026-06-10",
-        returns_on: "2026-06-18",
-        trip_cost_inr: 257300,
-      },
-      travelers: ["Maya Patel"],
-    },
-    customer: {
-      customer_id: "CUS-3001",
-      name: "Maya Patel",
-      email: "maya.patel@example.com",
-      phone: "+1 201 555 0143",
-      address: {
-        street: "48 Wayne Street, Apt 5C",
-        city: "Jersey City",
-        state: "NJ",
-        zip: "07302",
-      },
-      customer_since: "2023-04-11",
-      previous_claims: [
-        {
-          claim_id: "CLM-0412",
-          filed_on: "2024-08-19",
-          incident_date: "2024-08-09",
-          claim_type: "baggage_delay",
-          summary: "Checked bag arrived late in Lisbon",
-          outcome: "approved",
-          amount_paid_inr: 11620,
-        },
-      ],
-    },
-    plan: {
-      plan: "premium",
-      name: "UnderCover Premium",
-      trip_cancellation_max_inr: 415000,
-      trip_delay_waiting_hours: 6,
-      trip_delay_max_inr: 66400,
-      baggage_delay_waiting_hours: 12,
-      baggage_delay_max_inr: 24900,
-      baggage_max_inr: 124500,
-      per_item_limit_inr: 24900,
-      passport_max_inr: 20750,
-      emergency_medical_max_inr: 8300000,
-      deductible_inr: 4150,
-    },
-    add_ons: [],
-    company: { payout_approval_limit_inr: 83000, usd_to_inr_rate: 83 },
-    handlers: [
-      {
-        handler_id: "HND-01",
-        name: "Dana Whitfield",
-        role: "Senior Claims Handler",
-      },
-      { handler_id: "HND-02", name: "Marcus Oyelaran", role: "Claims Handler" },
-    ],
-    policy_wording: "Section 3: Trip Delay\nAll amounts are in rupees.",
-    status,
-    decision,
-    sign_off_handler_id: signOffHandlerId,
-    payment,
-    progress,
-  };
-}
-
-function requestPath(input: RequestInfo | URL): string {
-  if (typeof input === "string") return input;
-  if (input instanceof URL) return input.toString();
-  return input.url;
-}
-
-function jsonResponse(body: unknown): Response {
-  return new Response(JSON.stringify(body));
-}
-
-function mockApi(initialDetail: ClaimDetail = makeDetail()) {
-  let currentDetail = initialDetail;
-  const instructions =
-    "Use the policy wording. Keep the decision explanation brief.";
-  const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
-    const path = requestPath(input);
-    if (path === "/api/claims" && init?.method !== "POST") {
-      return Promise.resolve(
-        jsonResponse({
-          claims: [makeSummary(currentDetail.status, currentDetail.decision)],
-        }),
-      );
-    }
-    if (path === "/api/claims/CLM-1001" && init?.method !== "POST") {
-      return Promise.resolve(jsonResponse(currentDetail));
-    }
-    if (path === "/api/instructions") {
-      return Promise.resolve(jsonResponse({ instructions }));
-    }
-    if (path.endsWith("/run")) {
-      currentDetail = makeDetail("decided", approvedDecision, null, null, [
-        progressEvent,
-      ]);
-      return Promise.resolve(jsonResponse({ status: "in progress" }));
-    }
-    if (path.endsWith("/sign-off")) {
-      currentDetail = makeDetail("decided", approvedDecision, "HND-01");
-      return Promise.resolve(
-        jsonResponse({ status: "decided", handler_id: "HND-01" }),
-      );
-    }
-    if (path.endsWith("/pay")) {
-      currentDetail = makeDetail("decided", approvedDecision, null, {
-        amount_inr: approvedDecision.payout_inr,
-        simulated: true,
-      });
-      return Promise.resolve(
-        jsonResponse({ status: "paid", simulated: true, amount_inr: 34860 }),
-      );
-    }
-    return Promise.resolve(
-      new Response(JSON.stringify({ detail: "Not found" }), { status: 404 }),
-    );
-  });
-  vi.stubGlobal("fetch", fetchMock);
-  return fetchMock;
-}
-
+import {
+  approvedDecision,
+  jsonResponse,
+  makeDetail,
+  makeRun,
+  makeSummary,
+  mockApi,
+  requestPath,
+} from "./App.testFixtures";
+import type { Decision } from "./api";
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
@@ -226,14 +31,18 @@ it("shows the queue and full claim details with INR amounts", async () => {
   expect(
     screen.getByText("My flight home was canceled because of a crew problem."),
   ).toBeDefined();
-  expect(screen.getAllByText("₹34,860.00").length).toBeGreaterThan(0);
+  expect(screen.getAllByText(/34,860\.00/).length).toBeGreaterThan(0);
   expect(screen.getByText("Supporting documents")).toBeDefined();
   expect(screen.getByText("Claim history")).toBeDefined();
 });
 
-it("shows all four queue states", async () => {
+it("shows queue states including handler review", async () => {
   const fetchMock = vi.fn((input: RequestInfo | URL): Promise<Response> => {
-    if (requestPath(input) === "/api/claims") {
+    const path = requestPath(input);
+    if (path === "/api/agent/runs/current") {
+      return Promise.resolve(jsonResponse({ run: null }));
+    }
+    if (path === "/api/claims") {
       return Promise.resolve(
         jsonResponse({
           claims: [
@@ -241,6 +50,7 @@ it("shows all four queue states", async () => {
             { ...makeSummary("in progress"), claim_id: "CLM-1002" },
             { ...makeSummary("waiting for sign-off"), claim_id: "CLM-1003" },
             { ...makeSummary("decided"), claim_id: "CLM-1004" },
+            { ...makeSummary("needs handler"), claim_id: "CLM-1005" },
           ],
         }),
       );
@@ -253,6 +63,7 @@ it("shows all four queue states", async () => {
   expect(await screen.findByText("waiting for sign-off")).toBeDefined();
   expect(screen.getByText("in progress")).toBeDefined();
   expect(screen.getByText("decided")).toBeDefined();
+  expect(screen.getByText("needs handler")).toBeDefined();
 });
 
 it("starts a claim and shows its progress and decision", async () => {
@@ -267,6 +78,7 @@ it("starts a claim and shows its progress and decision", async () => {
   expect(
     await screen.findByText("Checking the story and receipts."),
   ).toBeDefined();
+  expect(await screen.findByText("Reviewed one claim.")).toBeDefined();
   expect(fetchMock).toHaveBeenCalledWith(
     "/api/claims/CLM-1001/run",
     expect.objectContaining({ method: "POST" }),
@@ -303,7 +115,7 @@ it("records a simulated payment for an approved claim", async () => {
   );
 
   expect(
-    await screen.findByText("Simulated payment recorded: ₹34,860.00"),
+    await screen.findByText(/Simulated payment recorded:.*34,860\.00/),
   ).toBeDefined();
   expect(fetchMock).toHaveBeenCalledWith(
     "/api/claims/CLM-1001/pay",
@@ -319,10 +131,134 @@ it("shows the read-only agent instructions", async () => {
 
   expect(
     await screen.findByText(
-      "Use the policy wording. Keep the decision explanation brief.",
+      "Choose the ordered batch and keep its tasks current.",
     ),
   ).toBeDefined();
+  expect(
+    await screen.findByText("Use the policy wording and claims manual."),
+  ).toBeDefined();
   expect(screen.queryByRole("textbox")).toBeNull();
+});
+
+it("starts a capped queue run and displays its saved tasks and summary", async () => {
+  const fetchMock = mockApi();
+  render(<App />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Run queue" }));
+
+  expect(
+    await screen.findByRole("heading", { name: "Run summary" }),
+  ).toBeDefined();
+  expect(
+    await screen.findByText(
+      "Reviewed 5 claims: 3 approved, 1 declined, 1 referred, 0 need handler attention.",
+    ),
+  ).toBeDefined();
+  expect(screen.getByText("CLM-1005")).toBeDefined();
+  expect(screen.getAllByText("done")).toHaveLength(5);
+  expect(fetchMock).toHaveBeenCalledWith(
+    "/api/agent/runs",
+    expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ max_claims: 5 }),
+    }),
+  );
+});
+
+it("shows the policy and manual sections read for the selected claim", async () => {
+  mockApi();
+  render(<App />);
+
+  expect(
+    await screen.findByRole("heading", {
+      name: "Policy and manual sections read",
+    }),
+  ).toBeDefined();
+  expect(screen.getByText("Section 7: Trip Delay Claims")).toBeDefined();
+  expect(screen.getByText(/claims manual/)).toBeDefined();
+  const sourceSummary = screen
+    .getByText("Section 3: Trip Delay")
+    .closest("summary");
+  if (sourceSummary === null)
+    throw new Error("Policy source summary is missing");
+  fireEvent.click(sourceSummary);
+  expect(
+    await screen.findByText(
+      "The wording covers eligible expenses after a covered delay.",
+    ),
+  ).toBeDefined();
+});
+
+it("polls task changes and keeps the completed run after current becomes null", async () => {
+  let currentRun = makeRun("in progress", 2);
+  let currentReads = 0;
+  const completedRun = makeRun("completed", 2);
+  const fetchMock = vi.fn((input: RequestInfo | URL): Promise<Response> => {
+    const path = requestPath(input);
+    if (path === "/api/agent/runs/current") {
+      currentReads += 1;
+      if (currentReads > 2) {
+        currentRun = completedRun;
+        return Promise.resolve(jsonResponse({ run: null }));
+      }
+      return Promise.resolve(jsonResponse({ run: currentRun }));
+    }
+    if (path === "/api/agent/runs/RUN-0001") {
+      return Promise.resolve(jsonResponse(currentRun));
+    }
+    if (path === "/api/claims") {
+      return Promise.resolve(jsonResponse({ claims: [makeSummary()] }));
+    }
+    return Promise.resolve(jsonResponse(makeDetail()));
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+
+  expect(
+    await screen.findByRole("heading", { name: "Current run" }),
+  ).toBeDefined();
+  expect(
+    await screen.findByRole(
+      "heading",
+      { name: "Run summary" },
+      { timeout: 4000 },
+    ),
+  ).toBeDefined();
+  expect(screen.getAllByText("done")).toHaveLength(2);
+});
+
+it("shows a clear error when a queue run cannot start", async () => {
+  const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const path = requestPath(input);
+    if (path === "/api/agent/runs" && init?.method === "POST") {
+      return Promise.resolve(
+        jsonResponse(
+          {
+            detail: {
+              message: "Another agent run is already active",
+              run_id: "RUN-9",
+            },
+          },
+          409,
+        ),
+      );
+    }
+    if (path === "/api/agent/runs/current") {
+      return Promise.resolve(jsonResponse({ run: null }));
+    }
+    if (path === "/api/claims") {
+      return Promise.resolve(jsonResponse({ claims: [makeSummary()] }));
+    }
+    return Promise.resolve(jsonResponse(makeDetail()));
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Run queue" }));
+
+  expect(
+    await screen.findByText("Another agent run is already active"),
+  ).toBeDefined();
 });
 
 it("reports queue API errors", async () => {

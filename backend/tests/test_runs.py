@@ -3,12 +3,20 @@ import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
 from backend import database, main
 from backend.main import app
+
+
+def required_run(run_id: str) -> dict[str, Any]:
+    """Return a persisted run or fail the test with a clear assertion."""
+    run = database.get_run(run_id)
+    assert run is not None
+    return run
 
 
 def decision(reason: str = "A handler should review the claim.") -> dict[str, object]:
@@ -154,7 +162,7 @@ def test_simultaneous_acquisitions_have_one_winner(client: TestClient):
     assert claim is not None
     assert claim["status"] == "in progress"
     assert claim["run_id"] == run_id
-    assert len(database.get_run(run_id)["todos"]) == 1
+    assert len(required_run(run_id)["todos"]) == 1
 
 
 def test_failed_attempt_retries_in_run_and_failure_count_carries_across_runs(
@@ -163,7 +171,7 @@ def test_failed_attempt_retries_in_run_and_failure_count_carries_across_runs(
     first_run = "first-failure-run"
     database.create_run(first_run, "claim", 1)
     database.select_run_claims(first_run, ["CLM-1001"])
-    first_todo = database.get_run(first_run)["todos"][0]
+    first_todo = required_run(first_run)["todos"][0]
     database.set_todo_status(first_todo["todo_id"], "in progress")
 
     first_failure = database.fail_claim_attempt(
@@ -171,7 +179,7 @@ def test_failed_attempt_retries_in_run_and_failure_count_carries_across_runs(
     )
     first_attempt = database.get_claim_record("CLM-1001")
     retry_number = database.retry_claim_attempt(first_run, "CLM-1001")
-    retried = database.get_run(first_run)["todos"][0]
+    retried = required_run(first_run)["todos"][0]
 
     assert first_failure == {
         "failure_count": 1,
@@ -186,7 +194,7 @@ def test_failed_attempt_retries_in_run_and_failure_count_carries_across_runs(
 
     database.fail_claim_attempt(first_run, "CLM-1001", "Tool failed again")
     failed = database.get_claim_record("CLM-1001")
-    failed_todo = database.get_run(first_run)["todos"][0]
+    failed_todo = required_run(first_run)["todos"][0]
 
     assert failed is not None
     assert failed["status"] == "needs handler"
@@ -200,7 +208,7 @@ def test_failure_count_from_an_interrupted_run_applies_to_next_run(
     first_run = "cross-run-first"
     database.create_run(first_run, "claim", 1)
     database.select_run_claims(first_run, ["CLM-1001"])
-    first_todo = database.get_run(first_run)["todos"][0]
+    first_todo = required_run(first_run)["todos"][0]
     database.set_todo_status(first_todo["todo_id"], "in progress")
     database.fail_claim_attempt(first_run, "CLM-1001", "Provider timeout")
     database.interrupt_run(first_run)
@@ -208,7 +216,7 @@ def test_failure_count_from_an_interrupted_run_applies_to_next_run(
     second_run = "cross-run-second"
     database.create_run(second_run, "queue", 1)
     database.select_run_claims(second_run, ["CLM-1001"])
-    second_todo = database.get_run(second_run)["todos"][0]
+    second_todo = required_run(second_run)["todos"][0]
     database.set_todo_status(second_todo["todo_id"], "in progress")
     result = database.fail_claim_attempt(second_run, "CLM-1001", "Tool failed")
     claim = database.get_claim_record("CLM-1001")
@@ -227,7 +235,7 @@ def test_expired_run_is_interrupted_and_creates_a_recovery_run(
     run_id = "crashed-run"
     database.create_run(run_id, "queue", 1)
     database.select_run_claims(run_id, ["CLM-1001"])
-    todo = database.get_run(run_id)["todos"][0]
+    todo = required_run(run_id)["todos"][0]
     database.set_todo_status(todo["todo_id"], "in progress")
     with database.connection() as db:
         db.execute(
@@ -274,7 +282,7 @@ def test_recovery_uses_saved_decision_state_to_resume_only_incomplete_work(
     run_id = "partial-decision-crash"
     database.create_run(run_id, "queue", 2)
     database.select_run_claims(run_id, ["CLM-1001", "CLM-1002"])
-    todos = database.get_run(run_id)["todos"]
+    todos = required_run(run_id)["todos"]
     for todo in todos:
         database.set_todo_status(todo["todo_id"], "in progress")
     database.save_decision(
@@ -319,7 +327,7 @@ def test_new_run_recovers_expired_run_before_accepting_queue_work(
     run_id = "expired-before-new-run"
     database.create_run(run_id, "queue", 1)
     database.select_run_claims(run_id, ["CLM-1001"])
-    todo = database.get_run(run_id)["todos"][0]
+    todo = required_run(run_id)["todos"][0]
     database.set_todo_status(todo["todo_id"], "in progress")
     with database.connection() as db:
         db.execute(
@@ -351,7 +359,7 @@ def test_new_run_recovers_expired_run_before_accepting_queue_work(
     claim = client.get("/api/claims/CLM-1001").json()
 
     assert response.status_code == 200
-    assert database.get_run(run_id)["status"] == "interrupted"
+    assert required_run(run_id)["status"] == "interrupted"
     assert recovery_run["run_type"] == "recovery"
     assert recovery_run["status"] == "completed"
     assert claim["status"] == "decided"
@@ -471,7 +479,8 @@ def test_named_claim_creates_a_one_item_run(
     response = client.post("/api/claims/CLM-1001/run")
     run = client.get("/api/agent/runs/current").json()["run"]
 
-    assert response.json() == {"status": "in progress"}
+    assert response.json()["status"] == "in progress"
+    assert response.json()["run_id"] == run["run_id"]
     assert run["run_type"] == "claim"
     assert run["max_claims"] == 1
     assert [item["claim_id"] for item in run["todos"]] == ["CLM-1001"]

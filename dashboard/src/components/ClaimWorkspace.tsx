@@ -1,5 +1,6 @@
 import type { ClaimDetail } from "../api";
 import { ClaimOverview } from "./ClaimOverview";
+import { KnowledgeReadsCard } from "./KnowledgeReadsCard";
 import {
   ActivityCard,
   CustomerCard,
@@ -33,6 +34,7 @@ export function ClaimWorkspace(props: ClaimWorkspaceProps) {
           <CustomerCard detail={props.detail} />
         </div>
       </div>
+      <KnowledgeReadsCard detail={props.detail} />
     </div>
   );
 }

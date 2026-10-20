@@ -34,7 +34,8 @@ def test_start_claim_marks_in_progress_before_background_work(
     response = client.post("/api/claims/CLM-1001/run")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "in progress"}
+    assert response.json()["status"] == "in progress"
+    assert response.json()["run_id"] == captured[0][1]
     assert captured[0][0] == "CLM-1001"
     assert captured[0][2].startswith(captured[0][1])
     claim = client.get("/api/claims/CLM-1001").json()
