@@ -10,10 +10,11 @@ from agent.testing import (
     StubModel,
     stub_model,
     stub_over_limit_model,
+    stub_queue_model,
     stub_refer_model,
     tool_message,
 )
-from backend import database
+from backend import database, main as backend_main
 from backend.main import app
 
 
@@ -87,6 +88,80 @@ def test_run_uses_instructions_api_and_records_decision(monkeypatch, tmp_path):
         event["step"] for event in database.list_events("CLM-1001")
     }
     assert len(database.list_source_reads("CLM-1001")) == 2
+
+
+def test_queue_run_plans_order_and_uses_fresh_claim_helpers(monkeypatch, tmp_path):
+    use_test_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(main, "backend", lambda: TestClient(app))
+    monkeypatch.setattr(backend_main, "process_queue_run", lambda run_id: None)
+    with TestClient(app) as client:
+        started = client.post("/api/agent/runs", json={"max_claims": 5})
+        run_id = started.json()["run_id"]
+        waiting_before = [
+            claim["claim_id"]
+            for claim in client.get("/api/claims").json()["claims"]
+            if claim["status"] == "waiting"
+        ]
+
+    expected_order = list(reversed(waiting_before[:5]))
+    helper_threads = []
+    helper_agents = []
+    original_helper = main.run_claim_helper
+    original_factory = main.create_agent
+
+    def tracked_helper(claim_id, thread_id):
+        helper_threads.append((claim_id, thread_id))
+        return original_helper(claim_id, thread_id)
+
+    def tracked_factory(*args, **kwargs):
+        created = original_factory(*args, **kwargs)
+        helper_agents.append(created)
+        return created
+
+    monkeypatch.setattr(main, "run_claim_helper", tracked_helper)
+    monkeypatch.setattr(main, "create_agent", tracked_factory)
+    monkeypatch.setattr(
+        main,
+        "queue_model",
+        lambda candidate_ids, max_claims, queue_run_id: stub_queue_model(
+            candidate_ids, max_claims, queue_run_id
+        ),
+    )
+
+    def claim_model(claim_id=None):
+        assert claim_id is not None
+        record = database.get_claim_record(claim_id)
+        assert record is not None
+        return stub_refer_model(claim_id, record["claim"]["claim_type"])
+
+    monkeypatch.setattr(main, "model", claim_model)
+
+    summary = main.run_queue(run_id, f"{run_id}-thread")
+
+    with TestClient(app) as client:
+        completed = client.get(f"/api/agent/runs/{run_id}").json()
+        claims = {
+            claim["claim_id"]: claim
+            for claim in client.get("/api/claims").json()["claims"]
+        }
+
+    assert [todo["claim_id"] for todo in completed["todos"]] == expected_order
+    assert {todo["status"] for todo in completed["todos"]} == {"done"}
+    assert completed["status"] == "completed"
+    assert completed["summary"] == summary
+    assert all(claims[claim_id]["status"] == "decided" for claim_id in expected_order)
+    assert sum(claim["status"] == "waiting" for claim in claims.values()) == 20
+    assert [claim_id for claim_id, _ in helper_threads] == expected_order
+    assert len({thread_id for _, thread_id in helper_threads}) == 5
+    assert len({id(agent) for agent in helper_agents}) == 6
+    for claim_id in expected_order:
+        record = database.get_claim_record(claim_id)
+        assert record is not None
+        assert record["decision"]["manual_version"] == "2026.2"
+        assert {read["source"] for read in database.list_source_reads(claim_id)} == {
+            "claims_manual",
+            "policy_wording",
+        }
 
 
 def test_agent_records_decline_with_policy_evidence(monkeypatch, tmp_path):
@@ -214,7 +289,8 @@ def test_model_respects_model_name_and_defaults(monkeypatch):
     monkeypatch.delenv("MODEL_NAME", raising=False)
     default_model = main.model()
     assert isinstance(default_model, ChatOpenAI)
-    assert default_model.model_name == "openai/gpt-6-luna"
+    assert default_model.model_name == "deepseek/deepseek-v4.1-flash"
+    assert default_model.reasoning_effort == "low"
     monkeypatch.setenv("MODEL_NAME", "openrouter/free")
     configured_model = main.model()
     assert isinstance(configured_model, ChatOpenAI)

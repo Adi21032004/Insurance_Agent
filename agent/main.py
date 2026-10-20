@@ -12,14 +12,14 @@ from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field, SecretStr
 
-from agent.testing import stub_model, stub_over_limit_model
-from backend.schemas import ItemSelection
+from agent.testing import stub_model, stub_over_limit_model, stub_queue_model
+from backend.schemas import ItemSelection, RunTodoItemInput
 
 load_dotenv()
 
 BACKEND_URL = os.getenv("UNDERCOVER_BACKEND_URL", "http://127.0.0.1:8000")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_MODEL = "openai/gpt-6-luna"
+DEFAULT_MODEL = "deepseek/deepseek-v4.1-flash"
 PAYMENT_CONFLICT_STATUS = 409
 
 
@@ -148,6 +148,23 @@ def pay_claim(claim_id: str, amount_inr: float) -> str:
     return json.dumps(response.json())
 
 
+@tool
+def save_run_plan(run_id: str, items: list[RunTodoItemInput]) -> str:
+    """Reserve claims and persist the queue agent's ordered to-do list."""
+    with backend() as client:
+        response = client.post(
+            f"/api/agent/runs/{run_id}/select",
+            json={"claim_ids": [item.claim_id for item in items]},
+        )
+        response.raise_for_status()
+        response = client.put(
+            f"/api/agent/runs/{run_id}/todos",
+            json={"items": [item.model_dump() for item in items]},
+        )
+        response.raise_for_status()
+    return json.dumps(response.json())
+
+
 def model(claim_id: str | None = None) -> BaseChatModel:
     """Return the configured test model or the OpenRouter model."""
     if os.getenv("UNDERCOVER_AGENT_TEST_MODE") == "1":
@@ -162,6 +179,24 @@ def model(claim_id: str | None = None) -> BaseChatModel:
         api_key=SecretStr(os.environ["OPENROUTER_API_KEY"]),
         reasoning_effort=None if name else "low",
     )
+
+
+def queue_model(
+    candidate_ids: list[str], max_claims: int, run_id: str
+) -> BaseChatModel:
+    """Return the configured queue planner model or its deterministic test stub."""
+    if os.getenv("UNDERCOVER_AGENT_TEST_MODE") == "1":
+        return stub_queue_model(candidate_ids, max_claims, run_id)
+    return model()
+
+
+def update_run_todo(run_id: str, todo_id: int, status: str) -> None:
+    """Persist one queue to-do state through the backend."""
+    with backend() as client:
+        response = client.patch(
+            f"/api/agent/runs/{run_id}/todos/{todo_id}", json={"status": status}
+        )
+    response.raise_for_status()
 
 
 def run(claim_id: str, thread_id: str) -> str:
@@ -188,3 +223,101 @@ def run(claim_id: str, thread_id: str) -> str:
         config={"configurable": {"thread_id": thread_id}},
     )
     return result["messages"][-1].text
+
+
+def run_queue(run_id: str, thread_id: str) -> str:
+    """Plan a capped queue run and review each selected claim in a fresh agent."""
+    with backend() as client:
+        run_response = client.get(f"/api/agent/runs/{run_id}")
+        run_response.raise_for_status()
+        run_record = run_response.json()
+        claims_response = client.get("/api/claims")
+        claims_response.raise_for_status()
+        waiting = [
+            claim
+            for claim in claims_response.json()["claims"]
+            if claim["status"] == "waiting"
+        ]
+    if run_record["run_type"] == "queue" and not run_record["selection_complete"]:
+        expected = min(run_record["max_claims"], len(waiting))
+        candidates = [claim["claim_id"] for claim in waiting]
+        planner = create_agent(
+            queue_model(candidates, run_record["max_claims"], run_id),
+            tools=[save_run_plan],
+            system_prompt=queue_instructions(),
+        )
+        planner.invoke(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "run_id": run_id,
+                                "max_claims": run_record["max_claims"],
+                                "waiting_claims": waiting,
+                                "required_count": expected,
+                            }
+                        ),
+                    }
+                ]
+            },
+            config={"configurable": {"thread_id": thread_id}},
+        )
+    with backend() as client:
+        run_response = client.get(f"/api/agent/runs/{run_id}")
+        run_response.raise_for_status()
+        run_record = run_response.json()
+    if not run_record["selection_complete"]:
+        raise RuntimeError("The queue agent did not save its plan")
+    expected = min(run_record["max_claims"], len(waiting))
+    if run_record["run_type"] == "queue" and len(run_record["todos"]) != expected:
+        raise RuntimeError("The queue agent did not select the full capped batch")
+
+    outcomes = {"approve": 0, "decline": 0, "refer": 0, "failed": 0}
+    for todo in run_record["todos"]:
+        update_run_todo(run_id, todo["todo_id"], "in progress")
+        database_detail = run_claim_helper(
+            todo["claim_id"], f"{thread_id}-{todo['claim_id']}-attempt1"
+        )
+        outcome = decision_outcome(todo["claim_id"])
+        if outcome is None:
+            raise RuntimeError(f"Claim helper saved no decision for {todo['claim_id']}")
+        update_run_todo(run_id, todo["todo_id"], "done")
+        outcomes[outcome] += 1
+        if not database_detail:
+            raise RuntimeError("The claim helper returned no report")
+
+    summary = (
+        f"Reviewed {len(run_record['todos'])} claims: {outcomes['approve']} approved, "
+        f"{outcomes['decline']} declined, {outcomes['refer']} referred, "
+        f"{outcomes['failed']} need handler attention."
+    )
+    with backend() as client:
+        response = client.post(
+            f"/api/agent/runs/{run_id}/complete", json={"summary": summary}
+        )
+    response.raise_for_status()
+    return summary
+
+
+def queue_instructions() -> str:
+    """Read queue instructions from the backend."""
+    with backend() as client:
+        response = client.get("/api/instructions")
+    response.raise_for_status()
+    return response.json()["queue_instructions"]
+
+
+def run_claim_helper(claim_id: str, thread_id: str) -> str:
+    """Create a fresh claim agent and run it on one selected claim."""
+    return run(claim_id, thread_id)
+
+
+def decision_outcome(claim_id: str) -> str | None:
+    """Read a claim's recorded outcome after its helper returns."""
+    with backend() as client:
+        response = client.get(f"/api/agent/claims/{claim_id}")
+    response.raise_for_status()
+    decision = response.json()["decision"]
+    return decision["outcome"] if decision is not None else None

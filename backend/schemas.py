@@ -81,6 +81,12 @@ class RunSelectionInput(BaseModel):
     claim_ids: list[str]
 
 
+class RunCompleteInput(BaseModel):
+    """Short handler summary used to close one run."""
+
+    summary: str = Field(min_length=1)
+
+
 class RunTodoStatusInput(BaseModel):
     """Allowed state for one queue run work item."""
 

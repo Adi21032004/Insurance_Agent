@@ -64,12 +64,12 @@ Make the queue agent plan an ordered batch from waiting claims, keep its to-do l
 
 Success criteria:
 
-- [ ] `uv run pytest agent/tests/test_agent.py backend/tests/test_runs.py -q --no-cov` passes using stub models, with no model-provider calls.
-- [ ] A stubbed queue run capped at five selects five distinct waiting claims in the agent's planned order, completes their to-do items, returns a handler summary, and leaves every unselected claim waiting.
-- [ ] The named-claim entry point reviews only the requested claim and persists the same run and to-do state as a queue run.
-- [ ] Tests show every claim helper starts with a fresh message history and unique thread, while its progress events and read sections are recorded against the correct claim.
-- [ ] Tests confirm the claim helper retrieves only needed manual and wording sections, records the section references and manual version with its decision, and obtains the payout from the backend.
-- [ ] Model configuration tests confirm the default model is `deepseek/deepseek-v4.1-flash` with low reasoning effort and that `MODEL_NAME` overrides the default.
+- [x] `uv run pytest agent/tests/test_agent.py backend/tests/test_runs.py -q --no-cov` passes using stub models, with no model-provider calls.
+- [x] A stubbed queue run capped at five selects five distinct waiting claims in the agent's planned order, completes their to-do items, returns a handler summary, and leaves every unselected claim waiting.
+- [x] The named-claim entry point reviews only the requested claim and persists the same run and to-do state as a queue run.
+- [x] Tests show every claim helper starts with a fresh message history and unique thread, while its progress events and read sections are recorded against the correct claim.
+- [x] Tests confirm the claim helper retrieves only needed manual and wording sections, records the section references and manual version with its decision, and obtains the payout from the backend.
+- [x] Model configuration tests confirm the default model is `deepseek/deepseek-v4.1-flash` with low reasoning effort and that `MODEL_NAME` overrides the default.
 
 ## Phase 4: Recover failed claims and finish each capped run
 

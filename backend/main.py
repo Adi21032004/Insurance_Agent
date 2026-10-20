@@ -7,7 +7,7 @@ from uuid import uuid4
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 
 from agent.instructions import CLAIM_INSTRUCTIONS, QUEUE_INSTRUCTIONS
-from agent.main import run as run_agent
+from agent.main import run_queue as run_queue_agent
 from backend import database
 from backend.knowledge import read_section, search_sections, split_sections
 from backend.money import (
@@ -28,6 +28,7 @@ from backend.schemas import (
     PayoutInput,
     ProgressInput,
     RunSelectionInput,
+    RunCompleteInput,
     RunStartInput,
     RunTodoPlanInput,
     RunTodoStatusInput,
@@ -102,66 +103,28 @@ def require_in_progress(record: dict[str, Any]) -> None:
         raise HTTPException(status_code=409, detail="Claim is not in progress")
 
 
-def process_claim(claim_id: str, thread_id: str) -> None:
-    """Run one claim and return incomplete work to the queue."""
-    try:
-        run_agent(claim_id, thread_id)
-    except Exception:
-        record = database.get_claim_record(claim_id)
-        if record is not None and record["decision"] is None:
-            database.set_claim_status(claim_id, "waiting")
-            database.add_event(
-                claim_id,
-                "Review paused",
-                "The agent could not finish. The claim returned to the waiting queue.",
-            )
-        return
-    record = database.get_claim_record(claim_id)
-    if record is not None and record["decision"] is None:
-        database.set_claim_status(claim_id, "waiting")
-        database.add_event(
-            claim_id,
-            "Review paused",
-            "The agent did not record a decision. "
-            "The claim returned to the waiting queue.",
-        )
-
-
 def process_queue_run(run_id: str) -> None:
-    """Process the claims selected for one persisted run."""
-    run = database.get_run(run_id)
-    if run is None:
-        return
-    decided = 0
-    failed = 0
-    for todo in run["todos"]:
-        claim_id = todo["claim_id"]
-        record = database.get_claim_record(claim_id)
-        if (
-            record is None
-            or record["status"] != "in progress"
-            or record["run_id"] != run_id
-        ):
+    """Run the queue agent and return unfinished claims to a safe state."""
+    try:
+        run_queue_agent(run_id, f"{run_id}-{uuid4()}")
+    except Exception:
+        run = database.get_run(run_id)
+        if run is None:
+            return
+        for todo in run["todos"]:
+            record = database.get_claim_record(todo["claim_id"])
+            if record is not None and record["decision"] is None:
+                database.set_claim_status(todo["claim_id"], "waiting")
+                database.add_event(
+                    todo["claim_id"],
+                    "Review paused",
+                    "The agent could not finish. The claim returned to the waiting queue.",
+                )
             database.set_todo_status(todo["todo_id"], "left for handler")
-            continue
-        database.set_todo_status(todo["todo_id"], "in progress")
-        database.add_event(
-            claim_id, "Review started", "The agent began reviewing the claim."
+        database.finish_run(
+            run_id,
+            "The run could not finish. Review the selected claims and start another run.",
         )
-        process_claim(claim_id, f"{run_id}-{claim_id}-{uuid4()}")
-        updated = database.get_claim_record(claim_id)
-        if updated is not None and updated["decision"] is not None:
-            database.set_todo_status(todo["todo_id"], "done")
-            decided += 1
-        else:
-            database.set_todo_status(todo["todo_id"], "left for handler")
-            failed += 1
-    summary = (
-        f"Reviewed {decided} claims. {failed} claim(s) need handler attention."
-        if failed
-        else f"Reviewed {decided} claims. No claims need handler attention."
-    )
-    database.finish_run(run_id, summary)
 
 
 def create_run_for_claim(claim_id: str) -> str:
@@ -169,6 +132,7 @@ def create_run_for_claim(claim_id: str) -> str:
     run_id = str(uuid4())
     database.create_run(run_id, "claim", 1)
     database.select_run_claims(run_id, [claim_id])
+    database.add_event(claim_id, "Review started", f"Assigned to run {run_id}.")
     return run_id
 
 
@@ -289,13 +253,8 @@ def start_queue_run(
     run_id = str(uuid4())
     try:
         database.create_run(run_id, "queue", request.max_claims)
-        claim_ids = database.list_waiting_claim_ids(request.max_claims)
-        database.select_run_claims(run_id, claim_ids)
     except ValueError as error:
-        if "already active" in str(error):
-            raise active_run_conflict() from error
-        database.interrupt_run(run_id)
-        raise HTTPException(status_code=409, detail=str(error)) from error
+        raise active_run_conflict() from error
     background_tasks.add_task(process_queue_run, run_id)
     return {
         "run_id": run_id,
@@ -329,6 +288,8 @@ def select_run_claims(run_id: str, request: RunSelectionInput) -> dict[str, Any]
     except ValueError as error:
         status_code = 409 if "not waiting" in str(error) else 422
         raise HTTPException(status_code=status_code, detail=str(error)) from error
+    for claim_id in request.claim_ids:
+        database.add_event(claim_id, "Review started", f"Assigned to run {run_id}.")
     return {"status": "selected", "claim_ids": request.claim_ids}
 
 
@@ -342,6 +303,22 @@ def plan_run_todos(run_id: str, request: RunTodoPlanInput) -> dict[str, str]:
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     return {"status": "ok"}
+
+
+@app.post("/api/agent/runs/{run_id}/complete", operation_id="complete_run")
+def complete_run(run_id: str, request: RunCompleteInput) -> dict[str, str]:
+    """Store a handler summary and close a completed queue run."""
+    run = database.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run["status"] != "in progress":
+        raise HTTPException(status_code=409, detail="Run is not active")
+    if not run["selection_complete"]:
+        raise HTTPException(status_code=409, detail="Run has no completed selection")
+    if any(item["status"] not in {"done", "left for handler"} for item in run["todos"]):
+        raise HTTPException(status_code=409, detail="Run still has unfinished work")
+    database.finish_run(run_id, request.summary)
+    return {"status": "completed", "summary": request.summary}
 
 
 @app.patch("/api/agent/runs/{run_id}/todos/{todo_id}", operation_id="update_run_todo")

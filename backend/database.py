@@ -230,6 +230,7 @@ def initialize_database() -> None:
                 max_claims INTEGER NOT NULL,
                 status TEXT NOT NULL,
                 summary TEXT,
+                selection_complete INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 finished_at TEXT,
                 heartbeat_at TEXT
@@ -288,6 +289,11 @@ def initialize_database() -> None:
         run_columns = {
             row[1] for row in db.execute("PRAGMA table_info(runs)").fetchall()
         }
+        if "selection_complete" not in run_columns:
+            db.execute(
+                "ALTER TABLE runs ADD COLUMN selection_complete "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
         if "heartbeat_at" not in run_columns:
             db.execute("ALTER TABLE runs ADD COLUMN heartbeat_at TEXT")
         count = db.execute("SELECT COUNT(*) FROM claims").fetchone()[0]
@@ -575,21 +581,27 @@ def validate_selection_request(
 ) -> None:
     """Reject invalid claim selection before making any reservation."""
     run = db.execute(
-        "SELECT max_claims, status FROM runs WHERE run_id = ?", (run_id,)
+        "SELECT run_type, max_claims, status, selection_complete "
+        "FROM runs WHERE run_id = ?",
+        (run_id,),
     ).fetchone()
     if run is None:
         raise KeyError(run_id)
     if run["status"] != "in progress":
         raise ValueError("Run is not active")
+    if run["selection_complete"]:
+        raise ValueError("Claims have already been selected for this run")
     if len(claim_ids) > run["max_claims"]:
         raise ValueError("Selected claims exceed the run cap")
     if len(set(claim_ids)) != len(claim_ids):
         raise ValueError("A claim can only be selected once")
-    if (
-        db.execute("SELECT 1 FROM run_todos WHERE run_id = ?", (run_id,)).fetchone()
-        is not None
-    ):
-        raise ValueError("Claims have already been selected for this run")
+    if run["run_type"] == "queue":
+        waiting_count = db.execute(
+            "SELECT COUNT(*) FROM claims WHERE status = 'waiting'"
+        ).fetchone()[0]
+        expected = min(run["max_claims"], waiting_count)
+        if len(claim_ids) != expected:
+            raise ValueError(f"Run must select exactly {expected} waiting claims")
 
 
 def validate_claims_waiting(db: sqlite3.Connection, claim_ids: list[str]) -> None:
@@ -623,6 +635,7 @@ def select_run_claims(run_id: str, claim_ids: list[str]) -> None:
                 "(run_id, position, claim_id, description) VALUES (?, ?, ?, ?)",
                 (run_id, position, claim_id, f"Review {claim_id}"),
             )
+        db.execute("UPDATE runs SET selection_complete = 1 WHERE run_id = ?", (run_id,))
 
 
 def plan_run_todos(run_id: str, items: list[dict[str, str]]) -> None:

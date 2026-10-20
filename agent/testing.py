@@ -105,6 +105,28 @@ def stub_model(claim_id: str) -> StubModel:
     return StubModel(messages=messages)
 
 
+def stub_queue_model(
+    candidate_ids: list[str], max_claims: int, run_id: str
+) -> StubModel:
+    """Return a queue plan with a distinct order for capped-run tests."""
+    selected = list(reversed(candidate_ids[:max_claims]))
+    items = [
+        {"claim_id": claim_id, "description": f"Review {claim_id}"}
+        for claim_id in selected
+    ]
+    messages: Iterator[AIMessage] = iter(
+        [
+            tool_message(
+                "save_run_plan",
+                {"run_id": run_id, "items": items},
+                "queue-1",
+            ),
+            AIMessage(content="Queue plan saved."),
+        ]
+    )
+    return StubModel(messages=messages)
+
+
 def stub_over_limit_model(claim_id: str) -> StubModel:
     """Return a fake model that tries to pay an over-limit medical approval."""
     payout_request = {
@@ -188,7 +210,7 @@ def stub_over_limit_model(claim_id: str) -> StubModel:
     return StubModel(messages=messages)
 
 
-def stub_refer_model(claim_id: str) -> StubModel:
+def stub_refer_model(claim_id: str, benefit: str = "baggage") -> StubModel:
     """Return a fake model that refers an unsupported baggage claim."""
     messages: Iterator[AIMessage] = iter(
         [
@@ -248,7 +270,7 @@ def stub_refer_model(claim_id: str) -> StubModel:
                         "A handler should review the evidence before deciding coverage."
                     ),
                     "policy_section": "Section 5: Baggage and Personal Effects",
-                    "benefit": "baggage",
+                    "benefit": benefit,
                     "items": [],
                     "paid_by_others_inr": 0,
                 },

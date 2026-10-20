@@ -22,16 +22,29 @@ def decision(reason: str = "A handler should review the claim.") -> dict[str, ob
     }
 
 
+def finish_stub_queue(run_id: str, thread_id: str) -> str:
+    run = database.get_run(run_id)
+    assert run is not None
+    if run["run_type"] == "queue":
+        waiting = database.list_waiting_claim_ids(run["max_claims"])
+        database.select_run_claims(run_id, waiting)
+    run = database.get_run(run_id)
+    assert run is not None
+    for todo in run["todos"]:
+        database.set_todo_status(todo["todo_id"], "in progress")
+        database.save_decision(todo["claim_id"], decision(), "decided")
+        database.set_todo_status(todo["todo_id"], "done")
+    summary = f"Reviewed {len(run['todos'])} claims."
+    database.finish_run(run_id, summary)
+    return summary
+
+
 def test_queue_run_is_capped_and_persists_ordered_todos(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
     monkeypatch.setattr(database, "DATABASE_PATH", tmp_path / "claims.sqlite3")
 
-    def decide(claim_id: str, thread_id: str) -> str:
-        database.save_decision(claim_id, decision(), "decided")
-        return "Referred for review."
-
-    monkeypatch.setattr(main, "run_agent", decide)
+    monkeypatch.setattr(main, "run_queue_agent", finish_stub_queue)
     with TestClient(app) as client:
         response = client.post("/api/agent/runs", json={"max_claims": 5})
         run_id = response.json()["run_id"]
@@ -63,6 +76,11 @@ def test_only_one_run_can_be_active_and_conflict_returns_run_id(
     monkeypatch.setattr(main, "process_queue_run", lambda run_id: None)
 
     first = client.post("/api/agent/runs", json={"max_claims": 2})
+    selected = database.list_waiting_claim_ids(2)
+    client.post(
+        f"/api/agent/runs/{first.json()['run_id']}/select",
+        json={"claim_ids": selected},
+    )
     active = client.get("/api/agent/runs/current").json()["run"]
     second = client.post("/api/agent/runs", json={"max_claims": 1})
 
@@ -145,6 +163,8 @@ def test_run_todo_plan_requires_the_selected_claims(
     monkeypatch.setattr(main, "process_queue_run", lambda run_id: None)
     run_response = client.post("/api/agent/runs", json={"max_claims": 2})
     run_id = run_response.json()["run_id"]
+    selected = database.list_waiting_claim_ids(2)
+    client.post(f"/api/agent/runs/{run_id}/select", json={"claim_ids": selected})
     run = client.get("/api/agent/runs/current").json()["run"]
     selected = [item["claim_id"] for item in run["todos"]]
 
@@ -174,6 +194,10 @@ def test_todo_statuses_are_persisted_and_invalid_status_is_rejected(
     monkeypatch.setattr(main, "process_queue_run", lambda run_id: None)
     response = client.post("/api/agent/runs", json={"max_claims": 1})
     run_id = response.json()["run_id"]
+    client.post(
+        f"/api/agent/runs/{run_id}/select",
+        json={"claim_ids": database.list_waiting_claim_ids(1)},
+    )
     run = client.get("/api/agent/runs/current").json()["run"]
     todo_id = run["todos"][0]["todo_id"]
 
