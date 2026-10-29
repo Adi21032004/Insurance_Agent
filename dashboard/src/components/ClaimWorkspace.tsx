@@ -16,7 +16,6 @@ type ClaimWorkspaceProps = Readonly<{
   onHandlerChange: (handlerId: string) => void;
   onRun: () => void;
   onSignOff: () => void;
-  onPay: () => void;
 }>;
 
 export function ClaimWorkspace(props: ClaimWorkspaceProps) {

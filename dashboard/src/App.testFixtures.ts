@@ -15,6 +15,8 @@ export const approvedDecision: Decision = {
   calculation: [{ step: "Hotel and meals", amount_inr: 34860 }],
   payout_inr: 34860,
   needs_sign_off: false,
+  signed_off_by: null,
+  signed_off_at: null,
 };
 
 export const progressEvent: ProgressEvent = {
@@ -44,6 +46,13 @@ export function makeDetail(
   payment: ClaimDetail["payment"] = null,
   progress: ProgressEvent[] = [],
 ): ClaimDetail {
+  let signedOffBy: string | null = null;
+  if (signOffHandlerId === "HND-01") {
+    signedOffBy = "Dana Whitfield";
+  } else if (signOffHandlerId !== null) {
+    signedOffBy = "Marcus Oyelaran";
+  }
+
   return {
     claim: {
       claim_id: "CLM-1001",
@@ -139,8 +148,17 @@ export function makeDetail(
     ],
     policy_wording: "Section 3: Trip Delay\nAll amounts are in rupees.",
     status,
-    decision,
+    decision:
+      decision === null
+        ? null
+        : {
+            ...decision,
+            signed_off_by: signedOffBy,
+            signed_off_at:
+              signOffHandlerId === null ? null : "2026-10-17 14:05:00",
+          },
     sign_off_handler_id: signOffHandlerId,
+    sign_off_at: signOffHandlerId === null ? null : "2026-10-17 14:05:00",
     payment,
     progress,
     failure_count: 0,
@@ -261,19 +279,17 @@ export function mockApi(initialDetail: ClaimDetail = makeDetail()) {
         return jsonResponse({ status: "in progress", run_id: savedRun.run_id });
       },
       "/api/claims/CLM-1001/sign-off": () => {
-        currentDetail = makeDetail("decided", approvedDecision, "HND-01");
-        return jsonResponse({ status: "decided", handler_id: "HND-01" });
+        currentDetail = makeDetail("in progress", approvedDecision, "HND-01");
+        return jsonResponse({ status: "in progress", handler_id: "HND-01" });
       },
-      "/api/claims/CLM-1001/pay": () => {
-        currentDetail = makeDetail("decided", approvedDecision, null, {
+      "/api/claims/CLM-1001/payment": () => {
+        currentDetail = makeDetail("decided", approvedDecision, "HND-01", {
           amount_inr: approvedDecision.payout_inr,
           simulated: true,
+          signed_off_by: "Dana Whitfield",
+          signed_off_at: "2026-10-17 14:05:00",
         });
-        return jsonResponse({
-          status: "paid",
-          simulated: true,
-          amount_inr: 34860,
-        });
+        return jsonResponse(currentDetail);
       },
     };
   const notFound = () =>

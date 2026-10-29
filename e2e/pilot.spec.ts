@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { resumedClaims } from "./api";
 
 test("the dashboard keeps the health check and completes a standard claim", async ({
   page,
@@ -18,13 +19,11 @@ test("the dashboard keeps the health check and completes a standard claim", asyn
     page.getByText("Checking the story, policy and supporting documents."),
   ).toBeVisible();
   await expect(page.getByText("Approved", { exact: true })).toBeVisible();
-  await expect(
-    page.getByText("Simulated payment recorded: ₹34,860.00"),
-  ).toBeVisible();
+  await expect(page.getByText("Paid ₹34,860.00")).toBeVisible();
   await expect(claim).toContainText("decided");
 });
 
-test("an over-limit claim needs handler sign-off before simulated payment", async ({
+test("an over-limit claim resumes after handler sign-off and is paid", async ({
   page,
 }) => {
   await page.goto("/");
@@ -49,9 +48,14 @@ test("an over-limit claim needs handler sign-off before simulated payment", asyn
   expect(await unpaidClaim.json()).toHaveProperty("payment", null);
 
   await page.getByRole("button", { name: "Sign off payout" }).click();
-  await page.getByRole("button", { name: "Record simulated payment" }).click();
+  await expect(page.getByText(/Signed off by Dana Whitfield at/)).toBeVisible();
+  expect(await resumedClaims(page.request)).toContain("CLM-1003");
+  const payment = await page.request.post("/api/claims/CLM-1003/payment", {
+    data: { amount_inr: 311250 },
+  });
+  expect(payment.ok()).toBeTruthy();
   await expect(
-    page.getByText("Simulated payment recorded: ₹3,11,250.00"),
+    page.getByText(/Paid ₹3,11,250\.00, signed off by Dana Whitfield at/),
   ).toBeVisible();
   await expect(claim).toContainText("decided");
 });
@@ -104,9 +108,11 @@ test("a capped queue run retries, routes a second failure and leaves other claim
     page.getByRole("heading", { name: "Policy and manual sections read" }),
   ).toBeVisible();
   await expect(
-    page.getByText("Section 5: Baggage and Personal Effects"),
+    page.getByText("Section 5: Baggage and Personal Effects", { exact: true }),
   ).toBeVisible();
-  await expect(page.getByText("claims_manual:05")).toBeVisible();
+  await expect(
+    page.getByText("claims_manual:05", { exact: true }),
+  ).toBeVisible();
 
   await page.getByRole("button", { name: "Agent instructions" }).click();
   await expect(

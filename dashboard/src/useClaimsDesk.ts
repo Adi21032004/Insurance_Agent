@@ -5,7 +5,6 @@ import {
   getCurrentRun,
   getInstructions,
   getRun,
-  recordPayment,
   signOffClaim,
   startClaim,
   startQueueRun,
@@ -247,14 +246,6 @@ export function useClaimsDesk() {
     );
   }, [runClaimAction, selectedClaimId, selectedHandler]);
 
-  const handlePay = useCallback(() => {
-    const payout = detail?.decision?.payout_inr;
-    if (selectedClaimId === null || payout === undefined) return;
-    void runClaimAction(selectedClaimId, () =>
-      recordPayment(selectedClaimId, payout),
-    );
-  }, [detail, runClaimAction, selectedClaimId]);
-
   const openInstructions = useCallback(async () => {
     setView("instructions");
     setError("");
@@ -274,7 +265,6 @@ export function useClaimsDesk() {
     claims,
     detail,
     error,
-    handlePay,
     handleQueueRun,
     handleRun,
     handleSignOff,

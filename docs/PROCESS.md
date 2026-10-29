@@ -1,6 +1,8 @@
 # Process
 
-`uv sync` and `npm install` at the repo root install everything, including a git pre-commit hook. `npm run dev` starts the backend and the dashboard.
+`uv sync` and `npm install` at the repo root install everything, including a git pre-commit hook. `npm run dev` starts the backend, the agent service on port 8002 and the dashboard. Set `DATABASE_URL` when the application and agent checkpoints should use Postgres; without it, the backend uses SQLite and the agent service uses in-memory checkpoints.
+
+`npm run seed` rebuilds the configured application's tables from the approved seed files. With a Supabase `DATABASE_URL`, it reseeds the UnderCover tables in Supabase. It removes current application records in that database before reseeding. Tests use temporary SQLite files, clear database and provider credentials, and do not read `.env`.
 
 `npm run check` runs every check:
 

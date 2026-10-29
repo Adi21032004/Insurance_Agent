@@ -1,4 +1,4 @@
-import { formatInr, type ClaimDetail } from "../api";
+import { formatInr, formatTime, type ClaimDetail } from "../api";
 import { StatusPill } from "./ClaimQueue";
 
 type ClaimOverviewProps = Readonly<{
@@ -8,7 +8,6 @@ type ClaimOverviewProps = Readonly<{
   onHandlerChange: (handlerId: string) => void;
   onRun: () => void;
   onSignOff: () => void;
-  onPay: () => void;
 }>;
 
 export function ClaimOverview({
@@ -18,9 +17,17 @@ export function ClaimOverview({
   onHandlerChange,
   onRun,
   onSignOff,
-  onPay,
 }: ClaimOverviewProps) {
   const claim = detail.claim;
+  const signedOffBy = detail.decision?.signed_off_by;
+  const signedOffAt = detail.sign_off_at;
+  let workMessage = "The UnderCover Agent is reviewing this claim.";
+  if (detail.decision?.outcome === "approve") {
+    workMessage = signedOffBy
+      ? `Signed off by ${signedOffBy} at ${formatTime(signedOffAt)}. Payment is processing.`
+      : "Waiting for the agent to pay it.";
+  }
+
   return (
     <section className="claim-overview card">
       <div className="claim-heading">
@@ -63,7 +70,7 @@ export function ClaimOverview({
         )}
         {detail.status === "in progress" && (
           <p className="working-message" aria-live="polite">
-            The UnderCover Agent is reviewing this claim.
+            {workMessage}
           </p>
         )}
         {detail.status === "waiting for sign-off" && (
@@ -97,23 +104,18 @@ export function ClaimOverview({
             </button>
           </div>
         )}
-        {detail.status === "decided" &&
-          detail.decision?.outcome === "approve" &&
-          detail.payment === null && (
-            <button
-              className="button button-primary"
-              disabled={actionBusy}
-              onClick={onPay}
-            >
-              Record simulated payment
-            </button>
-          )}
         {detail.payment !== null && (
           <p className="paid-message">
-            Simulated payment recorded: {formatInr(detail.payment.amount_inr)}
+            Paid {formatInr(detail.payment.amount_inr)}
+            {detail.payment.signed_off_by && (
+              <>
+                , signed off by {detail.payment.signed_off_by} at{" "}
+                {formatTime(detail.payment.signed_off_at)}
+              </>
+            )}
           </p>
         )}
-        {detail.sign_off_handler_id !== null && (
+        {detail.sign_off_handler_id !== null && signedOffBy === undefined && (
           <p className="signoff-message">
             Signed off by {detail.sign_off_handler_id}
           </p>

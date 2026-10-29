@@ -7,9 +7,55 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import JSON, inspect
+from sqlalchemy.pool import NullPool, QueuePool
 
 from backend import database, main
 from backend.main import app
+
+
+def test_database_uses_normalized_core_tables_and_json_columns(client: TestClient):
+    table_names = set(inspect(database.engine()).get_table_names())
+    settings = database.get_setting("handlers")
+
+    assert {
+        "settings",
+        "documents",
+        "handlers",
+        "customers",
+        "policies",
+        "claims",
+        "decisions",
+        "payments",
+        "steps",
+        "runs",
+        "todos",
+    }.issubset(table_names)
+    assert "events" not in table_names
+    assert isinstance(database.policies_table.c.policy_json.type, JSON)
+    assert isinstance(database.customers_table.c.customer_json.type, JSON)
+    assert settings[0]["handler_id"] == "HND-01"
+
+
+def test_database_selects_postgres_or_sqlite_without_connecting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://nobody:x@127.0.0.1:1/undercover")
+    postgres = database.engine()
+
+    assert postgres.url.drivername == "postgresql+psycopg"
+    assert isinstance(postgres.pool, QueuePool)
+    assert postgres.pool.size() == 4
+    assert postgres.pool._max_overflow == 0
+    assert database.POSTGRES_CONNECT_ARGS == {"options": "-c search_path=undercover"}
+    assert postgres.pool.checkedout() == 0
+
+    monkeypatch.delenv("DATABASE_URL")
+    monkeypatch.setattr(database, "DATABASE_PATH", tmp_path / "local.sqlite3")
+    sqlite = database.engine()
+
+    assert sqlite.url.drivername == "sqlite"
+    assert isinstance(sqlite.pool, NullPool)
 
 
 def required_run(run_id: str) -> dict[str, Any]:
@@ -237,6 +283,7 @@ def test_expired_run_is_interrupted_and_creates_a_recovery_run(
     database.select_run_claims(run_id, ["CLM-1001"])
     todo = required_run(run_id)["todos"][0]
     database.set_todo_status(todo["todo_id"], "in progress")
+    database.set_claim_thread_id("CLM-1001", "saved-claim-thread")
     with database.connection() as db:
         db.execute(
             "UPDATE runs SET heartbeat_at = '2000-01-01 00:00:00' WHERE run_id = ?",
@@ -260,20 +307,24 @@ def test_expired_run_is_interrupted_and_creates_a_recovery_run(
     assert recovery["run_type"] == "recovery"
     assert recovery["selection_complete"] == 1
     assert recovery["todos"][0]["claim_id"] == "CLM-1001"
+    assert recovery["todos"][0]["status"] == "in progress"
+    assert recovery["todos"][0]["attempt_count"] == 1
     assert claim is not None
     assert claim["status"] == "in progress"
     assert claim["run_id"] == continuation_id
-    assert claim["failure_count"] == 1
+    assert claim["thread_id"] == "saved-claim-thread"
+    assert claim["failure_count"] == 0
 
-    second_failure = database.fail_claim_attempt(
+    resumed_failure = database.fail_claim_attempt(
         continuation_id, "CLM-1001", "Recovery attempt failed"
     )
     claim_after = database.get_claim_record("CLM-1001")
 
-    assert second_failure["retry"] is False
+    assert resumed_failure["failure_count"] == 1
+    assert resumed_failure["retry"] is True
     assert claim_after is not None
-    assert claim_after["status"] == "needs handler"
-    assert claim_after["failure_count"] == 2
+    assert claim_after["status"] == "waiting"
+    assert claim_after["failure_count"] == 1
 
 
 def test_recovery_uses_saved_decision_state_to_resume_only_incomplete_work(
@@ -318,7 +369,8 @@ def test_recovery_uses_saved_decision_state_to_resume_only_incomplete_work(
     assert resumed_claim is not None
     assert resumed_claim["decision"]["outcome"] == "approve"
     assert resumed_claim["status"] == "in progress"
-    assert resumed_claim["failure_count"] == 1
+    assert resumed_claim["failure_count"] == 0
+    assert continuation["todos"][0]["status"] == "in progress"
 
 
 def test_new_run_recovers_expired_run_before_accepting_queue_work(
@@ -456,19 +508,22 @@ def test_decision_signoff_and_payment_writes_are_idempotent(client: TestClient):
     database.save_payment("CLM-1001", 0.0)
 
     with database.connection() as db:
-        decision_count = db.execute(
+        decision_row = db.execute(
             "SELECT COUNT(*) FROM decisions WHERE claim_id = 'CLM-1001'"
-        ).fetchone()[0]
-        signoff_count = db.execute(
+        ).fetchone()
+        signoff_row = db.execute(
             "SELECT COUNT(*) FROM signoffs WHERE claim_id = 'CLM-1001'"
-        ).fetchone()[0]
-        payment_count = db.execute(
+        ).fetchone()
+        payment_row = db.execute(
             "SELECT COUNT(*) FROM payments WHERE claim_id = 'CLM-1001'"
-        ).fetchone()[0]
+        ).fetchone()
 
-    assert decision_count == 1
-    assert signoff_count == 1
-    assert payment_count == 1
+    assert decision_row is not None
+    assert signoff_row is not None
+    assert payment_row is not None
+    assert decision_row[0] == 1
+    assert signoff_row[0] == 1
+    assert payment_row[0] == 1
 
 
 def test_named_claim_creates_a_one_item_run(

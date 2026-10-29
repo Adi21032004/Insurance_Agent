@@ -1,6 +1,8 @@
 """The UnderCover backend."""
 
+import logging
 import os
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from threading import Thread
 from typing import Any
@@ -9,8 +11,7 @@ from uuid import uuid4
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 
 from agent.instructions import CLAIM_INSTRUCTIONS, QUEUE_INSTRUCTIONS
-from agent.main import run_queue as run_queue_agent
-from backend import database
+from backend import agent_service, database
 from backend.knowledge import read_section, search_sections, split_sections
 from backend.money import (
     converted_claim,
@@ -21,11 +22,19 @@ from backend.money import (
     converted_strings,
     to_inr,
 )
-from backend.payout import calculate
+from backend.payout import (
+    LinePayout,
+    PayoutCoverage,
+    SelectedItemsPayout,
+    calculate_items,
+    calculate_lines,
+)
 from backend.schemas import (
     DecisionInput,
     KnowledgeReadInput,
     KnowledgeSearchInput,
+    LineDecisionInput,
+    LinePayoutInput,
     PaymentInput,
     PayoutInput,
     ProgressInput,
@@ -37,6 +46,7 @@ from backend.schemas import (
     RunTodoPlanInput,
     RunTodoStatusInput,
     SignOffInput,
+    ThreadInput,
 )
 
 
@@ -49,6 +59,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="UnderCover", lifespan=lifespan)
+logger = logging.getLogger(__name__)
+run_queue_agent: Callable[[str, str], str] | None = None
 
 
 def claim_payload(record: dict[str, Any]) -> dict[str, Any]:
@@ -62,6 +74,24 @@ def claim_payload(record: dict[str, Any]) -> dict[str, Any]:
     policy = converted_policy(record["policy"], rate)
     claim = converted_claim(record["claim"], rate)
     company = converted_company(company_settings)
+    decision = dict(record["decision"]) if record["decision"] is not None else None
+    sign_off_handler = next(
+        (
+            handler
+            for handler in database.get_setting("handlers")
+            if handler["handler_id"] == record["sign_off_handler_id"]
+        ),
+        None,
+    )
+    if decision is not None:
+        decision["signed_off_by"] = (
+            sign_off_handler["name"] if sign_off_handler is not None else None
+        )
+        decision["signed_off_at"] = record["sign_off_at"]
+    payment = dict(record["payment"]) if record["payment"] is not None else None
+    if payment is not None:
+        payment["signed_off_by"] = payment.get("signed_off_by")
+        payment["signed_off_at"] = record["sign_off_at"]
     return {
         "claim": claim,
         "policy": policy,
@@ -74,9 +104,11 @@ def claim_payload(record: dict[str, Any]) -> dict[str, Any]:
             database.get_setting("policy_wording"), rate
         ),
         "status": record["status"],
-        "decision": record["decision"],
+        "decision": decision,
         "sign_off_handler_id": record["sign_off_handler_id"],
-        "payment": record["payment"],
+        "sign_off_at": record["sign_off_at"],
+        "payment": payment,
+        "thread_id": record["thread_id"],
         "failure_count": record["failure_count"],
         "progress": database.list_events(record["claim"]["claim_id"]),
         "source_reads": database.list_source_reads(record["claim"]["claim_id"]),
@@ -87,6 +119,10 @@ def agent_claim_payload(record: dict[str, Any]) -> dict[str, Any]:
     """Build agent context without handing over either full source document."""
     payload = claim_payload(record)
     del payload["policy_wording"]
+    for item, source_item in zip(
+        payload["claim"]["items"], record["claim"]["items"], strict=True
+    ):
+        item["amount_usd"] = source_item["amount"]
     return payload
 
 
@@ -110,18 +146,14 @@ def require_in_progress(record: dict[str, Any]) -> None:
 
 
 def process_queue_run(run_id: str) -> None:
-    """Run the queue agent and recover any run-level failure."""
-    try:
-        run_queue_agent(run_id, f"{run_id}-{uuid4()}")
-    except Exception:
-        run = database.get_run(run_id)
-        if run is None or run["status"] != "in progress":
-            return
-        continuation_id = database.recover_expired_run(
-            run_id, run_lease_seconds(), force=True
-        )
-        if continuation_id is not None:
-            process_queue_run(continuation_id)
+    """Ask the independent agent service to process one saved queue run."""
+    if run_queue_agent is not None:
+        try:
+            run_queue_agent(run_id, f"{run_id}-{uuid4()}")
+        except Exception:
+            logger.exception("The test run worker stopped before finishing %s", run_id)
+        return
+    agent_service.run_queue(run_id)
 
 
 def run_lease_seconds() -> int:
@@ -162,9 +194,51 @@ def active_run_conflict() -> HTTPException:
     )
 
 
+def calculate(
+    claim_id: str,
+    benefit: str,
+    items: list[dict[str, Any]],
+    paid_by_others_inr: float,
+) -> dict[str, Any]:
+    """Calculate selected claim items with backend policy settings."""
+    record = claim_or_404(claim_id)
+    company = database.get_setting("company")
+    plans = database.get_setting("plans")
+    rate = company["usd_to_inr_rate"]
+    plan = next(
+        row
+        for row in converted_plans(plans, rate)["plans"]
+        if row["plan"] == record["policy"]["plan"]
+    )
+    electronics_limit = next(
+        row["electronics_per_item_limit"]
+        for row in plans["add_ons"]
+        if row["add_on"] == "electronics_plus"
+    )
+    return calculate_items(
+        SelectedItemsPayout(
+            claim=record,
+            coverage=PayoutCoverage(
+                plan,
+                record["policy"]["add_ons"],
+                rate,
+                plans["deductible_applies_to"],
+                electronics_limit,
+            ),
+            approval_limit_usd=company["payout_approval_limit"],
+            benefit=benefit,
+            selections=items,
+            paid_by_others_inr=paid_by_others_inr,
+        )
+    )
+
+
 def calculate_or_422(claim_id: str, request: PayoutInput) -> dict[str, Any]:
     """Return a payout calculation or a clear input error."""
     try:
+        record = claim_or_404(claim_id)
+        if request.benefit != record["claim"]["claim_type"]:
+            raise ValueError("Benefit does not match the claim type")
         return calculate(
             claim_id,
             request.benefit,
@@ -173,6 +247,28 @@ def calculate_or_422(claim_id: str, request: PayoutInput) -> dict[str, Any]:
         )
     except KeyError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+def calculate_lines_or_422(
+    record: dict[str, Any], request: LinePayoutInput
+) -> dict[str, Any]:
+    """Return the USD payout calculation for explicit claim lines."""
+    company = database.get_setting("company")
+    try:
+        if request.benefit != record["claim"]["claim_type"]:
+            raise ValueError("Benefit does not match the claim type")
+        return calculate_lines(
+            LinePayout(
+                policy=record["policy"],
+                plan_settings=database.get_setting("plans"),
+                approval_limit_usd=company["payout_approval_limit"],
+                benefit=request.benefit,
+                lines=[line.model_dump() for line in request.lines],
+                paid_by_others=request.paid_by_others,
+            )
+        )
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
 
@@ -280,10 +376,49 @@ def start_queue_run(
     }
 
 
+@app.post("/api/agent/runs/direct", operation_id="start_direct_queue_run")
+def start_direct_queue_run(request: RunStartInput) -> dict[str, Any]:
+    """Create a queue run for a caller that will process it directly."""
+    if database.get_current_run() is not None:
+        raise active_run_conflict()
+    run_id = str(uuid4())
+    try:
+        database.create_run(run_id, "queue", request.max_claims)
+    except ValueError as error:
+        raise active_run_conflict() from error
+    return {"run_id": run_id, "status": "in progress", "max_claims": request.max_claims}
+
+
 @app.get("/api/agent/runs/current", operation_id="get_current_run")
 def get_current_run() -> dict[str, Any]:
     """Return the active run and its work items, if one exists."""
     return {"run": database.get_current_run()}
+
+
+@app.get("/api/agent/runs/latest", operation_id="get_latest_run")
+def get_latest_run() -> dict[str, Any]:
+    """Return the most recently created run and its work items."""
+    return {"run": database.get_latest_run()}
+
+
+@app.post("/api/agent/runs/{run_id}/interrupt", operation_id="interrupt_run")
+def stop_run(run_id: str) -> dict[str, str]:
+    """Finish an abandoned run before the next run starts."""
+    if database.get_run(run_id) is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    database.interrupt_run(run_id)
+    return {"status": "interrupted"}
+
+
+@app.post("/api/agent/claims/{claim_id}/thread", operation_id="set_claim_thread")
+def set_claim_thread(claim_id: str, request: ThreadInput) -> dict[str, str]:
+    """Save the thread id assigned to the current claim attempt."""
+    claim_or_404(claim_id)
+    try:
+        thread_id = database.set_claim_thread_id(claim_id, request.thread_id)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return {"thread_id": thread_id}
 
 
 @app.get("/api/agent/runs/{run_id}", operation_id="get_run")
@@ -466,6 +601,18 @@ def start_claim(claim_id: str, background_tasks: BackgroundTasks) -> dict[str, s
     return {"status": "in progress", "run_id": run_id}
 
 
+@app.post("/api/claims/{claim_id}/run/direct", operation_id="start_direct_claim_run")
+def start_direct_claim_run(claim_id: str) -> dict[str, str]:
+    """Create a named claim run for an agent command-line caller."""
+    if database.get_current_run() is not None:
+        raise active_run_conflict()
+    record = claim_or_404(claim_id)
+    if record["status"] != "waiting":
+        raise HTTPException(status_code=409, detail="Claim is not waiting")
+    run_id = create_run_for_claim(claim_id)
+    return {"status": "in progress", "run_id": run_id}
+
+
 @app.post("/api/claims/{claim_id}/progress", operation_id="record_claim_progress")
 def record_claim_progress(claim_id: str, request: ProgressInput) -> dict[str, str]:
     """Record one step in the agent's claim review."""
@@ -475,22 +622,60 @@ def record_claim_progress(claim_id: str, request: ProgressInput) -> dict[str, st
     return {"status": "ok"}
 
 
-@app.post("/api/agent/claims/{claim_id}/payout", operation_id="calculate_payout")
+@app.post(
+    "/api/agent/claims/{claim_id}/payout",
+    operation_id="calculate_selected_item_payout",
+)
 def calculate_claim_payout(claim_id: str, request: PayoutInput) -> dict[str, Any]:
     """Calculate the policy payout in Indian rupees."""
     claim_or_404(claim_id)
     return calculate_or_422(claim_id, request)
 
 
-@app.post("/api/claims/{claim_id}/decision", operation_id="record_claim_decision")
-def record_claim_decision(claim_id: str, request: DecisionInput) -> dict[str, Any]:
+@app.post("/api/claims/{claim_id}/payout", operation_id="calculate_payout")
+def calculate_claim_lines(claim_id: str, request: LinePayoutInput) -> dict[str, Any]:
+    """Calculate a payout from explicit claim lines."""
+    record = claim_or_404(claim_id)
+    return calculate_lines_or_422(record, request)
+
+
+@app.post("/api/claims/{claim_id}/decision", operation_id="record_decision")
+def record_claim_decision(
+    claim_id: str, request: LineDecisionInput | DecisionInput
+) -> dict[str, Any]:
     """Record a policy decision and its backend-calculated payout."""
     record = claim_or_404(claim_id)
-    if record["decision"] is None:
+    had_decision = record["decision"] is not None
+    if not had_decision:
         require_in_progress(record)
-    payout = calculate_or_422(claim_id, request)
+    if isinstance(request, LineDecisionInput):
+        payout = calculate_lines_or_422(record, request)
+    else:
+        payout = calculate_or_422(claim_id, request)
     if request.outcome != "approve":
-        payout = {"calculation": [], "payout_inr": 0.0, "needs_sign_off": False}
+        payout = {
+            "calculation": [],
+            "payout": 0.0,
+            "payout_inr": 0.0,
+            "needs_sign_off": False,
+        }
+    if isinstance(request, LineDecisionInput):
+        rate = database.get_setting("company")["usd_to_inr_rate"]
+        payout = {
+            "calculation": [
+                {
+                    "step": line["step"],
+                    "amount_inr": to_inr(line["amount"], rate),
+                }
+                for line in payout["calculation"]
+            ],
+            "payout": payout["payout"],
+            "payout_inr": to_inr(payout["payout"], rate),
+            "needs_sign_off": payout["needs_sign_off"],
+        }
+    else:
+        rate = database.get_setting("company")["usd_to_inr_rate"]
+        payout["payout"] = round(payout["payout_inr"] / rate, 2)
     decision = {
         "outcome": request.outcome,
         "reason": request.reason,
@@ -509,17 +694,28 @@ def record_claim_decision(claim_id: str, request: DecisionInput) -> dict[str, An
         ],
         **payout,
     }
-    status = "waiting for sign-off" if payout["needs_sign_off"] else "decided"
+    status = (
+        "waiting for sign-off"
+        if request.outcome == "approve" and payout["needs_sign_off"]
+        else "in progress"
+        if request.outcome == "approve"
+        else "decided"
+    )
     try:
         database.save_decision(claim_id, decision, status)
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
+    if had_decision:
+        saved = claim_or_404(claim_id)
+        return {"decision": saved["decision"], "status": saved["status"]}
     database.add_event(claim_id, "Decision recorded", request.outcome.title())
     return {"decision": decision, "status": status}
 
 
 @app.post("/api/claims/{claim_id}/sign-off", operation_id="sign_off_claim")
-def sign_off_claim(claim_id: str, request: SignOffInput) -> dict[str, str]:
+def sign_off_claim(
+    claim_id: str, request: SignOffInput, background_tasks: BackgroundTasks
+) -> dict[str, str]:
     """Record a handler's sign-off on an over-limit claim."""
     record = claim_or_404(claim_id)
     if record["decision"] is None or record["decision"]["outcome"] != "approve":
@@ -527,17 +723,30 @@ def sign_off_claim(claim_id: str, request: SignOffInput) -> dict[str, str]:
             status_code=409, detail="Only approved claims can be signed off"
         )
     handlers = database.get_setting("handlers")
-    if request.handler_id not in {handler["handler_id"] for handler in handlers}:
-        raise HTTPException(status_code=422, detail="Unknown handler")
+    handler = next(
+        (item for item in handlers if item["handler_id"] == request.handler_id),
+        None,
+    )
+    if handler is None:
+        raise HTTPException(status_code=404, detail="Handler not found")
+    if not handler["can_approve_over_limit"]:
+        raise HTTPException(
+            status_code=403, detail="Handler cannot approve over-limit claims"
+        )
     try:
-        database.sign_off_claim(claim_id, request.handler_id)
+        signed_off_at = database.sign_off_claim(claim_id, request.handler_id)
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     database.add_event(claim_id, "Handler sign-off", request.handler_id)
-    return {"status": "decided", "handler_id": request.handler_id}
+    background_tasks.add_task(agent_service.resume_claim, claim_id)
+    return {
+        "status": "in progress",
+        "handler_id": request.handler_id,
+        "signed_off_at": signed_off_at,
+    }
 
 
-@app.post("/api/claims/{claim_id}/pay", operation_id="pay_claim")
+@app.post("/api/claims/{claim_id}/pay", operation_id="record_simulated_payment")
 def pay_claim(claim_id: str, request: PaymentInput) -> dict[str, Any]:
     """Record a simulated payment after approval and required sign-off."""
     record = claim_or_404(claim_id)
@@ -546,7 +755,7 @@ def pay_claim(claim_id: str, request: PaymentInput) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="Only approved claims can be paid")
     if round(request.amount_inr, 2) != decision["payout_inr"]:
         raise HTTPException(
-            status_code=409, detail="Payment amount must match the approved payout"
+            status_code=422, detail="Payment amount must match the approved payout"
         )
     if record["payment"] is not None:
         if round(record["payment"]["amount_inr"], 2) == round(request.amount_inr, 2):
@@ -557,16 +766,31 @@ def pay_claim(claim_id: str, request: PaymentInput) -> dict[str, Any]:
             }
         raise HTTPException(status_code=409, detail="Claim has already been paid")
     company_settings = database.get_setting("company")
-    approval_limit = to_inr(
-        company_settings["payout_approval_limit"], company_settings["usd_to_inr_rate"]
-    )
+    approval_limit_usd = company_settings["payout_approval_limit"]
+    approval_limit = to_inr(approval_limit_usd, company_settings["usd_to_inr_rate"])
     needs_sign_off = decision["payout_inr"] > approval_limit
     if needs_sign_off and record["sign_off_handler_id"] is None:
         raise HTTPException(
-            status_code=409, detail="Handler sign-off is required before payment"
+            status_code=403,
+            detail=(
+                f"A payout over ${approval_limit_usd:,.2f} needs a handler's sign-off"
+            ),
         )
+    handler_name = next(
+        (
+            handler["name"]
+            for handler in database.get_setting("handlers")
+            if handler["handler_id"] == record["sign_off_handler_id"]
+        ),
+        None,
+    )
     try:
-        database.save_payment(claim_id, round(request.amount_inr, 2))
+        database.save_payment(
+            claim_id,
+            round(request.amount_inr, 2),
+            handler_name,
+            record["sign_off_at"],
+        )
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     database.add_event(
@@ -577,3 +801,10 @@ def pay_claim(claim_id: str, request: PaymentInput) -> dict[str, Any]:
         "simulated": True,
         "amount_inr": round(request.amount_inr, 2),
     }
+
+
+@app.post("/api/claims/{claim_id}/payment", operation_id="pay_claim")
+def pay_claim_for_graph(claim_id: str, request: PaymentInput) -> dict[str, Any]:
+    """Record a simulated payment and return the updated claim."""
+    pay_claim(claim_id, request)
+    return claim_payload(claim_or_404(claim_id))

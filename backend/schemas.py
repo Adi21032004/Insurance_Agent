@@ -14,6 +14,37 @@ Benefit = Literal[
     "emergency_medical",
 ]
 
+LineKind = Literal[
+    "item", "electronics", "cash", "expense", "hotel", "meals_without_receipts"
+]
+
+
+class PayoutLine(BaseModel):
+    """One claimed item or expense, with every calculation input explicit."""
+
+    description: str = Field(min_length=1)
+    amount: float = Field(ge=0)
+    quantity: int = Field(ge=1)
+    kind: LineKind
+    nights: int = Field(ge=0)
+    hours: float = Field(ge=0)
+
+
+class LinePayoutInput(BaseModel):
+    """Inputs needed to calculate a payout from claim lines."""
+
+    benefit: Benefit
+    lines: list[PayoutLine]
+    paid_by_others: float = Field(ge=0)
+
+
+class LineDecisionInput(LinePayoutInput):
+    """Decision and policy evidence recorded by the durable claim graph."""
+
+    outcome: Literal["approve", "decline", "refer"]
+    reason: str = Field(min_length=1)
+    policy_section: str = Field(min_length=1)
+
 
 class ProgressInput(BaseModel):
     """One progress event written by the agent."""
@@ -60,6 +91,12 @@ class RunStartInput(BaseModel):
     """Maximum number of distinct waiting claims in a queue run."""
 
     max_claims: int = Field(ge=1, le=25)
+
+
+class ThreadInput(BaseModel):
+    """Thread identifier assigned to one claim attempt."""
+
+    thread_id: str = Field(min_length=1)
 
 
 class RunTodoItemInput(BaseModel):

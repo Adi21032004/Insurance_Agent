@@ -22,6 +22,8 @@ export interface Decision {
   calculation: CalculationStep[];
   payout_inr: number;
   needs_sign_off: boolean;
+  signed_off_by?: string | null;
+  signed_off_at?: string | null;
   manual_version?: string;
   sections_read?: {
     source: string;
@@ -136,6 +138,8 @@ export interface ProgressEvent {
 export interface PaymentRecord {
   amount_inr: number;
   simulated: boolean;
+  signed_off_by: string | null;
+  signed_off_at: string | null;
 }
 
 export interface ClaimDetail {
@@ -150,6 +154,7 @@ export interface ClaimDetail {
   status: ClaimStatus;
   decision: Decision | null;
   sign_off_handler_id: string | null;
+  sign_off_at: string | null;
   payment: PaymentRecord | null;
   failure_count: number;
   progress: ProgressEvent[];
@@ -256,21 +261,18 @@ export function signOffClaim(
   });
 }
 
-export function recordPayment(
-  claimId: string,
-  amountInr: number,
-): Promise<{ status: string; simulated: boolean; amount_inr: number }> {
-  return request(`/api/claims/${claimId}/pay`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ amount_inr: amountInr }),
-  });
-}
-
 export function formatInr(amount: number): string {
   return new Intl.NumberFormat("en-IN", {
     style: "currency",
     currency: "INR",
     minimumFractionDigits: 2,
   }).format(amount);
+}
+
+export function formatTime(timestamp: string | null | undefined): string {
+  if (timestamp === null || timestamp === undefined) return "";
+  return new Intl.DateTimeFormat("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(new Date(timestamp.replace(" ", "T")));
 }

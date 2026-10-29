@@ -39,8 +39,10 @@ def test_over_limit_payment_is_blocked_until_handler_signoff(
     blocked = client.post("/api/claims/CLM-1003/pay", json={"amount_inr": 83000.01})
 
     assert approved.json()["status"] == "waiting for sign-off"
-    assert blocked.status_code == 409
-    assert blocked.json()["detail"] == "Handler sign-off is required before payment"
+    assert blocked.status_code == 403
+    assert (
+        blocked.json()["detail"] == "A payout over $1,000.00 needs a handler's sign-off"
+    )
     assert client.get("/api/claims/CLM-1003").json()["payment"] is None
 
     signed_off = client.post(
@@ -49,7 +51,7 @@ def test_over_limit_payment_is_blocked_until_handler_signoff(
     paid = client.post("/api/claims/CLM-1003/pay", json={"amount_inr": 83000.01})
 
     assert signed_off.status_code == 200
-    assert signed_off.json()["status"] == "decided"
+    assert signed_off.json()["status"] == "in progress"
     assert paid.status_code == 200
     assert paid.json() == {
         "status": "paid",
@@ -57,7 +59,12 @@ def test_over_limit_payment_is_blocked_until_handler_signoff(
         "amount_inr": 83000.01,
     }
     claim = client.get("/api/claims/CLM-1003").json()
-    assert claim["payment"] == {"amount_inr": 83000.01, "simulated": True}
+    assert claim["payment"] == {
+        "amount_inr": 83000.01,
+        "simulated": True,
+        "signed_off_by": "Dana Whitfield",
+        "signed_off_at": claim["sign_off_at"],
+    }
     assert claim["sign_off_handler_id"] == "HND-01"
 
 
@@ -101,7 +108,7 @@ def test_payment_rejects_mismatch_and_unapproved_payment_and_replays_duplicate(
     duplicate = client.post("/api/claims/CLM-1001/pay", json={"amount_inr": payout})
 
     assert unapproved.status_code == 409
-    assert mismatch.status_code == 409
+    assert mismatch.status_code == 422
     assert paid.status_code == 200
     assert duplicate.status_code == 200
     assert duplicate.json() == paid.json()
@@ -120,5 +127,5 @@ def test_only_a_known_handler_can_sign_off(
         "/api/claims/CLM-1003/sign-off", json={"handler_id": "HND-02"}
     )
 
-    assert invalid_handler.status_code == 422
+    assert invalid_handler.status_code == 404
     assert valid_handler.status_code == 200

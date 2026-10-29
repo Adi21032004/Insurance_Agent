@@ -1,9 +1,10 @@
 import json
+import sys
 from pathlib import Path
+from types import ModuleType
 
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage
-from langchain_openai import ChatOpenAI
 
 from agent import main
 from agent.testing import (
@@ -74,7 +75,8 @@ def test_run_uses_instructions_api_and_records_decision(monkeypatch, tmp_path):
 
     reply = main.run("CLM-1001", "thread-1")
 
-    assert reply.startswith("Approved for ₹34,860.00")
+    assert reply.startswith("Approved for ")
+    assert "34,860.00" in reply
     record = database.get_claim_record("CLM-1001")
     assert record is not None
     assert record["decision"]["policy_section"] == "Section 3: Trip Delay"
@@ -84,7 +86,12 @@ def test_run_uses_instructions_api_and_records_decision(monkeypatch, tmp_path):
         "claims_manual",
         "policy_wording",
     }
-    assert record["payment"] == {"amount_inr": 34860.0, "simulated": True}
+    assert record["payment"] == {
+        "amount_inr": 34860.0,
+        "simulated": True,
+        "signed_off_by": None,
+        "signed_off_at": None,
+    }
     assert "Source section read" in {
         event["step"] for event in database.list_events("CLM-1001")
     }
@@ -349,17 +356,26 @@ def test_saved_decision_resumes_payment_without_creating_a_second_decision(
     main.run_queue(run_id, f"{run_id}-queue")
     claim = database.get_claim_record("CLM-1001")
     with database.connection() as db:
-        decisions = db.execute(
+        decision_row = db.execute(
             "SELECT COUNT(*) FROM decisions WHERE claim_id = 'CLM-1001'"
-        ).fetchone()[0]
-        payments = db.execute(
+        ).fetchone()
+        payment_row = db.execute(
             "SELECT COUNT(*) FROM payments WHERE claim_id = 'CLM-1001'"
-        ).fetchone()[0]
+        ).fetchone()
 
     assert saved_once == ["CLM-1001"]
     assert claim is not None
+    assert decision_row is not None
+    assert payment_row is not None
+    decisions = decision_row[0]
+    payments = payment_row[0]
     assert claim["decision"]["outcome"] == "approve"
-    assert claim["payment"] == {"amount_inr": 100.0, "simulated": True}
+    assert claim["payment"] == {
+        "amount_inr": 100.0,
+        "simulated": True,
+        "signed_off_by": None,
+        "signed_off_at": None,
+    }
     assert decisions == 1
     assert payments == 1
 
@@ -401,15 +417,19 @@ def test_two_failures_resuming_saved_payment_keep_decision_for_handler(
     run = database.get_run(run_id)
     claim = database.get_claim_record("CLM-1001")
     with database.connection() as db:
-        decisions = db.execute(
+        decision_row = db.execute(
             "SELECT COUNT(*) FROM decisions WHERE claim_id = 'CLM-1001'"
-        ).fetchone()[0]
-        payments = db.execute(
+        ).fetchone()
+        payment_row = db.execute(
             "SELECT COUNT(*) FROM payments WHERE claim_id = 'CLM-1001'"
-        ).fetchone()[0]
+        ).fetchone()
 
     assert run is not None
     assert run["status"] == "completed"
+    assert decision_row is not None
+    assert payment_row is not None
+    decisions = decision_row[0]
+    payments = payment_row[0]
     assert run["todos"][0]["status"] == "left for handler"
     assert claim is not None
     assert claim["status"] == "needs handler"
@@ -541,17 +561,26 @@ def test_agent_payment_tool_cannot_bypass_handler_signoff(monkeypatch, tmp_path)
 
 
 def test_model_respects_model_name_and_defaults(monkeypatch):
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            self.model_name = kwargs["model"]
+            self.reasoning_effort = kwargs["reasoning_effort"]
+            self.request_timeout = kwargs["timeout"]
+
+    module = ModuleType("langchain_openai")
+    module.__dict__["ChatOpenAI"] = FakeChatOpenAI
+    monkeypatch.setitem(sys.modules, "langchain_openai", module)
     monkeypatch.delenv("UNDERCOVER_AGENT_TEST_MODE", raising=False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.delenv("MODEL_NAME", raising=False)
     default_model = main.model()
-    assert isinstance(default_model, ChatOpenAI)
+    assert isinstance(default_model, FakeChatOpenAI)
     assert default_model.model_name == "deepseek/deepseek-v4.1-flash"
     assert default_model.reasoning_effort == "low"
     assert default_model.request_timeout == main.CLAIM_TIMEOUT_SECONDS
     monkeypatch.setenv("MODEL_NAME", "openrouter/free")
     configured_model = main.model()
-    assert isinstance(configured_model, ChatOpenAI)
+    assert isinstance(configured_model, FakeChatOpenAI)
     assert configured_model.model_name == "openrouter/free"
 
 

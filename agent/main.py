@@ -3,14 +3,15 @@
 import asyncio
 import json
 import os
+from importlib import import_module
 from typing import Any, Literal
 
 import httpx
-from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI
+from langfuse import get_client, propagate_attributes
+from langfuse.langchain import CallbackHandler
 from pydantic import BaseModel, Field, SecretStr
 
 from agent.testing import (
@@ -24,12 +25,10 @@ from agent.testing import (
 )
 from backend.schemas import ItemSelection, RunTodoItemInput
 
-load_dotenv()
-
 BACKEND_URL = os.getenv("UNDERCOVER_BACKEND_URL", "http://127.0.0.1:8000")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_MODEL = "deepseek/deepseek-v4.1-flash"
-PAYMENT_CONFLICT_STATUS = 409
+PAYMENT_CONFLICT_STATUS = 403
 CLAIM_TIMEOUT_SECONDS = float(os.getenv("UNDERCOVER_CLAIM_TIMEOUT_SECONDS", "120"))
 
 
@@ -195,7 +194,7 @@ def model(claim_id: str | None = None) -> BaseChatModel:
             test_claim_id, test_benefits.get(test_claim_id, "trip_delay")
         )
     name = os.getenv("MODEL_NAME")
-    return ChatOpenAI(
+    return import_module("langchain_openai").ChatOpenAI(
         model=name or DEFAULT_MODEL,
         base_url=OPENROUTER_BASE_URL,
         api_key=SecretStr(os.environ["OPENROUTER_API_KEY"]),
@@ -242,7 +241,7 @@ def run(claim_id: str, thread_id: str) -> str:
         system_prompt=response.json()["claim_instructions"],
     )
 
-    async def invoke_with_timeout():
+    async def invoke_with_timeout(callbacks: list[Any]):
         return await asyncio.wait_for(
             agent.ainvoke(
                 {
@@ -250,13 +249,27 @@ def run(claim_id: str, thread_id: str) -> str:
                         {"role": "user", "content": f"Review claim {claim_id}."}
                     ]
                 },
-                config={"configurable": {"thread_id": thread_id}},
+                config={
+                    "configurable": {"thread_id": thread_id},
+                    "callbacks": callbacks,
+                },
             ),
             timeout=CLAIM_TIMEOUT_SECONDS,
         )
 
-    result = asyncio.run(invoke_with_timeout())
-    return result["messages"][-1].text
+    if os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY"):
+        session_id = f"{claim_id}-{thread_id}"
+        langfuse = get_client()
+        with (
+            langfuse.start_as_current_observation(
+                as_type="span", name=f"claim-{claim_id}"
+            ),
+            propagate_attributes(session_id=session_id),
+        ):
+            result = asyncio.run(invoke_with_timeout([CallbackHandler()]))
+    else:
+        result = asyncio.run(invoke_with_timeout([]))
+    return str(result["messages"][-1].content)
 
 
 def load_run_context(run_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:

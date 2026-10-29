@@ -19,6 +19,8 @@ Our goal is to handle claims straight through, as accurately as our handlers do.
 
 The queue agent selects an ordered batch of waiting claims up to a handler-set cap of 1 to 25. It reviews each selected claim with a fresh claim agent and leaves claims outside the batch waiting. A failed claim gets one retry in the same run. If the second attempt fails, the claim is marked `needs handler` and the queue agent continues with the remaining claims. Before it closes the run, the agent reconciles every selected claim and retries any selected work that remains unresolved.
 
+Each claim review runs as a LangGraph workflow with a checkpoint for its thread. An approval over the sign-off limit pauses at the handler step and stays unpaid. When a handler signs off in the dashboard, the backend asks the agent service to resume that same claim thread and pay the approved amount. If the agent process has stopped, the next queue run carries the claim on from its saved checkpoint. A saved decision or payment is never recorded twice.
+
 ## What the team needs to see
 
 - The queue, with where each claim stands: waiting, in progress, waiting for sign-off, decided or needs handler.

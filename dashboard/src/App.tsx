@@ -84,7 +84,6 @@ export function App() {
                 actionBusy={desk.actionBusy}
                 detail={desk.detail}
                 onHandlerChange={desk.setSelectedHandler}
-                onPay={desk.handlePay}
                 onRun={desk.handleRun}
                 onSignOff={desk.handleSignOff}
                 selectedHandler={desk.selectedHandler}

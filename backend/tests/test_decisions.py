@@ -168,5 +168,5 @@ def test_exact_approval_limit_does_not_require_signoff(
     response = client.post("/api/claims/CLM-1003/decision", json=body)
 
     assert response.status_code == 200
-    assert response.json()["status"] == "decided"
+    assert response.json()["status"] == "in progress"
     assert response.json()["decision"]["needs_sign_off"] is False

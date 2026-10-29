@@ -313,3 +313,134 @@ def stub_refer_model(claim_id: str, benefit: str = "baggage") -> StubModel:
         ]
     )
     return StubModel(messages=messages)
+
+
+def durable_stub_model(claim_id: str) -> StubModel:
+    """Return a scripted model that uses the durable graph's tool names."""
+    if scheduled_stub_failure(claim_id):
+        return stub_provider_failure()
+    if claim_id == "CLM-1001":
+        benefit = "trip_delay"
+        lines = [
+            {
+                "description": "Hotel for one night",
+                "amount": 245.0,
+                "quantity": 1,
+                "kind": "hotel",
+                "nights": 1,
+                "hours": 0,
+            },
+            {
+                "description": "Meal expenses",
+                "amount": 95.0,
+                "quantity": 1,
+                "kind": "expense",
+                "nights": 0,
+                "hours": 0,
+            },
+            {
+                "description": "Taxi expenses",
+                "amount": 80.0,
+                "quantity": 1,
+                "kind": "expense",
+                "nights": 0,
+                "hours": 0,
+            },
+        ]
+        outcome = "approve"
+        policy_section = "Section 3: Trip Delay"
+        decision_reason = (
+            "The carrier confirms a covered crew cancellation and the delay exceeds "
+            "the plan's waiting period. The submitted expenses are supported by the "
+            "receipts and fall within the benefit limit."
+        )
+        policy_id = "policy_wording:03"
+        manual_id = "claims_manual:07"
+        policy_query = "trip delay waiting period expenses"
+        manual_query = "trip delay accommodation meals receipts"
+    elif claim_id == "CLM-1003":
+        benefit = "emergency_medical"
+        lines = [
+            {
+                "description": "Emergency medical expenses",
+                "amount": 3800.0,
+                "quantity": 1,
+                "kind": "expense",
+                "nights": 0,
+                "hours": 0,
+            }
+        ]
+        outcome = "approve"
+        policy_section = "Section 7: Emergency Medical"
+        decision_reason = (
+            "The medical report supports a sudden injury during the covered trip. "
+            "The itemized bill supports the requested treatment under Section 7."
+        )
+        policy_id = "policy_wording:07"
+        manual_id = "claims_manual:07"
+        policy_query = "emergency medical benefit"
+        manual_query = "medical records and sudden injury"
+    else:
+        benefit = {
+            "CLM-1002": "baggage",
+            "CLM-1004": "baggage_delay",
+            "CLM-1005": "passport",
+            "CLM-1007": "baggage",
+        }.get(claim_id, "trip_delay")
+        lines = []
+        outcome = "refer"
+        policy_section = "Section 5: Baggage and Personal Effects"
+        decision_reason = (
+            "The evidence does not establish that this loss meets the policy terms. "
+            "A handler should review the records and decide what further information "
+            "is needed."
+        )
+        policy_id = "policy_wording:05"
+        manual_id = "claims_manual:05"
+        policy_query = "baggage cover and exclusions"
+        manual_query = "evidence needed for baggage claims"
+    request = {
+        "benefit": benefit,
+        "lines": lines,
+        "paid_by_others": 0.0,
+    }
+    steps = [
+        tool_message("get_claim", {}, "durable-1"),
+        tool_message("get_policy", {}, "durable-2"),
+        tool_message("get_claim_history", {}, "durable-3"),
+        tool_message(
+            "search_documents",
+            {"source": "policy_wording", "query": policy_query},
+            "durable-4",
+        ),
+        tool_message(
+            "read_section",
+            {"source": "policy_wording", "section_id": policy_id},
+            "durable-5",
+        ),
+        tool_message(
+            "search_documents",
+            {"source": "claims_manual", "query": manual_query},
+            "durable-6",
+        ),
+        tool_message(
+            "read_section",
+            {"source": "claims_manual", "section_id": manual_id},
+            "durable-7",
+        ),
+    ]
+    if outcome == "approve":
+        steps.append(tool_message("calculate_payout", request, "durable-8"))
+    steps.append(
+        tool_message(
+            "record_decision",
+            {
+                **request,
+                "outcome": outcome,
+                "reason": decision_reason,
+                "policy_section": policy_section,
+            },
+            "durable-9",
+        )
+    )
+    return StubModel(messages=iter(steps))

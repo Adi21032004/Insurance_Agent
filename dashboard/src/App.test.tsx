@@ -10,7 +10,7 @@ import {
   mockApi,
   requestPath,
 } from "./App.testFixtures";
-import type { Decision } from "./api";
+import type { ClaimDetail, Decision } from "./api";
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
@@ -98,29 +98,44 @@ it("signs off a claim and refreshes its queue status", async () => {
     await screen.findByRole("button", { name: "Sign off payout" }),
   );
 
-  expect(await screen.findByText("Signed off by HND-01")).toBeDefined();
+  expect(
+    await screen.findByText(
+      "Signed off by Dana Whitfield at 2:05 PM. Payment is processing.",
+    ),
+  ).toBeDefined();
   expect(fetchMock).toHaveBeenCalledWith(
     "/api/claims/CLM-1001/sign-off",
     expect.objectContaining({ method: "POST" }),
   );
 });
 
-it("records a simulated payment for an approved claim", async () => {
-  const approved = makeDetail("decided", approvedDecision);
-  const fetchMock = mockApi(approved);
+it("shows when an approved payout is waiting for the agent to pay it", async () => {
+  mockApi(makeDetail("in progress", approvedDecision));
   render(<App />);
 
-  fireEvent.click(
-    await screen.findByRole("button", { name: "Record simulated payment" }),
-  );
+  expect(
+    await screen.findByText("Waiting for the agent to pay it."),
+  ).toBeDefined();
+  expect(
+    screen.queryByRole("button", { name: "Record simulated payment" }),
+  ).toBeNull();
+});
+
+it("shows the signed-off handler and time with the completed payment", async () => {
+  const paid: ClaimDetail["payment"] = {
+    amount_inr: 100000,
+    simulated: true,
+    signed_off_by: "Dana Whitfield",
+    signed_off_at: "2026-10-17 14:05:00",
+  };
+  mockApi(makeDetail("decided", approvedDecision, "HND-01", paid));
+  render(<App />);
 
   expect(
-    await screen.findByText(/Simulated payment recorded:.*34,860\.00/),
+    await screen.findByText(
+      "Paid ₹1,00,000.00, signed off by Dana Whitfield at 2:05 PM",
+    ),
   ).toBeDefined();
-  expect(fetchMock).toHaveBeenCalledWith(
-    "/api/claims/CLM-1001/pay",
-    expect.objectContaining({ method: "POST" }),
-  );
 });
 
 it("shows the read-only agent instructions", async () => {

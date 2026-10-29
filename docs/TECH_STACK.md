@@ -1,9 +1,10 @@
 # Tech stack
 
-- `backend/`: FastAPI and SQLite. Every API operation has an `operation_id`, a one-line docstring and no optional inputs. Paying a claim is a separate operation that takes the amount.
-- `agent/`: LangChain's `create_agent` on OpenRouter. `run_queue(run_id, thread_id)` plans and processes a capped ordered batch; it creates a fresh `run(claim_id, thread_id)` claim agent for every selected claim and retry. It reaches claims, policy and manual sections, and both instruction sets only through the backend API. The default model is `deepseek/deepseek-v4.1-flash` with low reasoning effort. `MODEL_NAME` overrides it, such as `openrouter/free`.
-- `dashboard/`: React, Vite and TypeScript.
-- `e2e/`: Playwright tests.
+- `backend/`: FastAPI with SQLAlchemy Core tables held in one `MetaData`. The tables cover settings, documents, handlers, customers, policies, claims, decisions, payments, steps, runs and to-dos. `DATABASE_URL` selects Postgres, including Supabase; local development and tests use SQLite through `UNDERCOVER_DB`. The backend calculates payouts and guards sign-off and payment operations.
+- `agent/`: a LangGraph `StateGraph` for each claim and LangChain's `create_agent` for queue planning. `work_claim(claim_id, graph)` starts a claim, `carry_on(claim_id, graph)` resumes a saved thread, and `run_queue(cap, llm, graph)` recovers saved work before starting a capped queue run. With `DATABASE_URL`, `PostgresSaver` stores checkpoints in the `undercover` schema with synchronous durability. Without it, the local service uses an in-memory saver. Langfuse traces claim work when its keys are configured.
+- `agent/service.py`: the agent's HTTP service. The backend calls it through `backend/agent_service.py`, at `UNDERCOVER_AGENT` or `http://127.0.0.1:8002`.
+- `dashboard/`: React, Vite and TypeScript. It displays claim progress, decisions, handler sign-offs and payments.
+- `e2e/`: Playwright tests with a deterministic agent stand-in and an isolated temporary SQLite database.
 - `data/`: the business data the backend starts from. The agent never sees `data/evals/`, which holds the answer key.
 
-Python 3.12 with uv, all in the root `pyproject.toml`. Node 26. The OpenRouter key is `OPENROUTER_API_KEY` in `.env`. `UNDERCOVER_CLAIM_TIMEOUT_SECONDS` configures claim-call timeouts (120 seconds by default); `UNDERCOVER_RUN_LEASE_SECONDS` configures run leases (300 seconds by default).
+Python 3.12 with uv, all in the root `pyproject.toml`. Node 26. `npm run dev` starts the backend, agent service and dashboard; `npm run seed` rebuilds the application tables in the configured database. Set `DATABASE_URL` to the Supabase Postgres URI when using Supabase and set `OPENROUTER_API_KEY` for live model calls. `MODEL_NAME` can select another model, including `openrouter/free`. Langfuse tracing uses `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY`. `UNDERCOVER_CLAIM_TIMEOUT_SECONDS` sets claim-call timeouts (120 seconds by default), and `UNDERCOVER_RUN_LEASE_SECONDS` sets run leases (300 seconds by default).

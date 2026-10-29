@@ -53,7 +53,7 @@ def test_start_claim_rejects_non_waiting_claim(client: TestClient):
     assert response.json()["detail"] == "Claim is not waiting"
 
 
-def test_repeated_run_level_failure_routes_claim_to_handler(
+def test_worker_stopping_before_persisting_failure_keeps_claim_recoverable(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ):
     def fail_run(run_id: str, thread_id: str) -> str:
@@ -64,12 +64,12 @@ def test_repeated_run_level_failure_routes_claim_to_handler(
 
     assert response.status_code == 200
     claim = client.get("/api/claims/CLM-1001").json()
-    assert claim["status"] == "needs handler"
-    assert claim["failure_count"] == 2
-    assert claim["progress"][-1]["step"] == "Attempt interrupted"
+    assert claim["status"] == "in progress"
+    assert claim["failure_count"] == 0
+    assert claim["decision"] is None
 
 
-def test_agent_that_finishes_without_decision_returns_claim_to_queue(
+def test_worker_stopping_without_a_decision_keeps_claim_recoverable(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ):
     def no_decision(run_id: str, thread_id: str) -> str:
@@ -81,8 +81,9 @@ def test_agent_that_finishes_without_decision_returns_claim_to_queue(
 
     assert response.status_code == 200
     claim = client.get("/api/claims/CLM-1001").json()
-    assert claim["status"] == "needs handler"
-    assert claim["failure_count"] == 2
+    assert claim["status"] == "in progress"
+    assert claim["failure_count"] == 0
+    assert claim["decision"] is None
 
 
 def test_decision_and_payment_api_replays_are_idempotent(client: TestClient):
@@ -146,18 +147,26 @@ def test_decision_and_payment_api_replays_are_idempotent(client: TestClient):
     assert replayed_over_limit_payment.status_code == 200
     assert replayed_over_limit_payment.json() == first_over_limit_payment.json()
     with database.connection() as db:
-        decisions = db.execute(
+        decision_row = db.execute(
             "SELECT COUNT(*) FROM decisions WHERE claim_id = 'CLM-1001'"
-        ).fetchone()[0]
-        payments = db.execute(
+        ).fetchone()
+        payment_row = db.execute(
             "SELECT COUNT(*) FROM payments WHERE claim_id = 'CLM-1002'"
-        ).fetchone()[0]
-        signoffs = db.execute(
+        ).fetchone()
+        signoff_row = db.execute(
             "SELECT COUNT(*) FROM signoffs WHERE claim_id = 'CLM-1003'"
-        ).fetchone()[0]
-        over_limit_payments = db.execute(
+        ).fetchone()
+        over_limit_payment_row = db.execute(
             "SELECT COUNT(*) FROM payments WHERE claim_id = 'CLM-1003'"
-        ).fetchone()[0]
+        ).fetchone()
+    assert decision_row is not None
+    assert payment_row is not None
+    assert signoff_row is not None
+    assert over_limit_payment_row is not None
+    decisions = decision_row[0]
+    payments = payment_row[0]
+    signoffs = signoff_row[0]
+    over_limit_payments = over_limit_payment_row[0]
     assert decisions == 1
     assert payments == 1
     assert signoffs == 1
