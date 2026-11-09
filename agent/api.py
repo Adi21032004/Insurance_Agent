@@ -142,6 +142,15 @@ def get_queue_claims() -> list[dict[str, Any]]:
     return response.json()["claims"]
 
 
+def get_dispatch_claims() -> list[dict[str, Any]]:
+    """Read claims eligible for a dispatch from the handler queue."""
+    return [
+        claim
+        for claim in get_queue_claims()
+        if claim["status"] in {"waiting", "in progress"}
+    ]
+
+
 def get_instructions() -> dict[str, str]:
     """Read both instruction sets from the backend."""
     with backend() as client:
@@ -156,6 +165,49 @@ def get_run(run_id: str) -> dict[str, Any]:
         response = client.get(f"/api/agent/runs/{run_id}")
     response.raise_for_status()
     return response.json()
+
+
+def create_dispatch(
+    run_id: str, agents: int, model: str, reasoning_effort: str
+) -> dict[str, Any]:
+    """Create one dispatch record through the backend."""
+    with backend() as client:
+        response = client.post(
+            "/api/runs/dispatches",
+            json={
+                "run_id": run_id,
+                "agents": agents,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+            },
+        )
+    response.raise_for_status()
+    return response.json()
+
+
+def record_run_claims(run_id: str, claim_ids: list[str]) -> None:
+    """Record the claims selected for one dispatch."""
+    with backend() as client:
+        response = client.put(
+            f"/api/runs/{run_id}/claims", json={"claim_ids": claim_ids}
+        )
+    response.raise_for_status()
+
+
+def finish_run(run_id: str) -> None:
+    """Finish a dispatch after every claim worker has returned."""
+    with backend() as client:
+        response = client.post(
+            f"/api/runs/{run_id}/finish", json={"summary": "Dispatch complete"}
+        )
+    response.raise_for_status()
+
+
+def stop_runs() -> None:
+    """Stop running dispatches if service execution fails."""
+    with backend() as client:
+        response = client.post("/api/runs/stop")
+    response.raise_for_status()
 
 
 def create_direct_run(max_claims: int) -> str:

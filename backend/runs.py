@@ -15,6 +15,13 @@ class DispatchStartInput(BaseModel):
     agents: int = Field(ge=1, le=25)
 
 
+class DispatchCreateInput(BaseModel):
+    run_id: str = Field(min_length=1)
+    agents: int = Field(ge=1, le=25)
+    model: str = Field(min_length=1)
+    reasoning_effort: str = Field(min_length=1)
+
+
 class EvaluationStartInput(BaseModel):
     evaluation_set: str = Field(min_length=1)
     tiny: bool
@@ -34,6 +41,8 @@ def start_dispatch(body: DispatchStartInput) -> dict[str, Any]:
     """Trigger a dispatch through the agent service and return its accepted status."""
     try:
         agent_service.start_dispatch(body.agents)
+    except agent_service.AgentServiceConflict as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     except RuntimeError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     return {"status": "accepted", "agents": body.agents}
@@ -48,6 +57,8 @@ def start_evaluation(body: EvaluationStartInput) -> dict[str, Any]:
             body.tiny,
             body.agents,
         )
+    except agent_service.AgentServiceConflict as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     except RuntimeError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     return {
@@ -79,16 +90,13 @@ def get_evaluation(run_id: str) -> dict[str, Any]:
 
 
 @router.post("/api/runs/dispatches", operation_id="create_dispatch")
-def create_dispatch(body: DispatchStartInput) -> dict[str, Any]:
+def create_dispatch(body: DispatchCreateInput) -> dict[str, Any]:
     """Persist a dispatch record and return it."""
-    if not 1 <= body.agents <= MAX_AGENTS:
-        raise HTTPException(status_code=422, detail="Dispatch agents must be 1-25")
-    run_id = f"dispatch-{len(database.list_evaluations()) + 1}"
     return database.create_dispatch(
-        run_id,
+        body.run_id,
         body.agents,
-        "openai/gpt-6-luna",
-        "low",
+        body.model,
+        body.reasoning_effort,
     )
 
 
@@ -111,7 +119,15 @@ def create_evaluation(body: EvaluationStartInput) -> dict[str, Any]:
 @router.put("/api/runs/{run_id}/claims", operation_id="record_run_claims")
 def record_run_claims(run_id: str, body: RunClaimInput) -> dict[str, Any]:
     """Persist a run's claims in order."""
-    database.record_run_claims(run_id, body.claim_ids)
+    try:
+        database.record_run_claims(run_id, body.claim_ids)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Run or claim not found") from error
+    except ValueError as error:
+        status_code = (
+            409 if "not active" in str(error) or "not available" in str(error) else 422
+        )
+        raise HTTPException(status_code=status_code, detail=str(error)) from error
     return {"run_id": run_id, "claim_ids": body.claim_ids}
 
 

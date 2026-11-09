@@ -11,7 +11,7 @@ from uuid import uuid4
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 
 from agent.instructions import CLAIM_INSTRUCTIONS, QUEUE_INSTRUCTIONS
-from backend import agent_service, database
+from backend import agent_service, database, runs
 from backend.knowledge import read_section, search_sections, split_sections
 from backend.money import (
     converted_claim,
@@ -59,6 +59,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="UnderCover", lifespan=lifespan)
+app.include_router(runs.router)
 logger = logging.getLogger(__name__)
 run_queue_agent: Callable[[str, str], str] | None = None
 

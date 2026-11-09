@@ -4,7 +4,7 @@ import contextvars
 import json
 import logging
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from importlib import import_module
 from typing import Annotated, Any, TypedDict
@@ -33,7 +33,7 @@ from agent.tools import CLAIM_TOOLS, ClaimContext
 from backend.schemas import RunTodoItemInput
 
 logger = logging.getLogger(__name__)
-DEFAULT_MODEL = "deepseek/deepseek-v4.1-flash"
+DEFAULT_MODEL = "openai/gpt-6-luna"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 CLAIM_TIMEOUT_SECONDS = float(os.getenv("UNDERCOVER_CLAIM_TIMEOUT_SECONDS", "120"))
 MAX_MODEL_CALLS = 30
@@ -195,7 +195,9 @@ def build_claim_graph(
     return builder.compile(checkpointer=saver)
 
 
-def _config(claim_id: str, thread_id: str, trace_name: str) -> dict[str, Any]:
+def _config(
+    claim_id: str, thread_id: str, trace_name: str, run_id: str | None = None
+) -> dict[str, Any]:
     """Build a claim-scoped checkpoint and tracing configuration."""
     return {
         "configurable": {"thread_id": thread_id},
@@ -203,20 +205,22 @@ def _config(claim_id: str, thread_id: str, trace_name: str) -> dict[str, Any]:
         "metadata": {
             "langfuse_session_id": f"{claim_id}:{thread_id}",
             "langfuse_trace_name": trace_name,
+            "langfuse_tags": [run_id] if run_id else [],
         },
     }
 
 
-def _invoke(
+def _invoke(  # noqa: PLR0913, PLR0917
     graph: Any,
     value: Any,
     claim_id: str,
     thread_id: str,
     trace_name: str,
+    run_id: str | None = None,
 ) -> Any:
     """Invoke the claim graph as a root Langfuse run and save each step."""
-    config = _config(claim_id, thread_id, trace_name)
-    context = {"claim_id": claim_id}
+    config = _config(claim_id, thread_id, trace_name, run_id)
+    context = {"claim_id": claim_id, "run_id": run_id}
     current_context = contextvars.Context()
     return current_context.run(
         lambda: graph.invoke(value, config, context=context, durability="sync")
@@ -246,11 +250,16 @@ def claim_report(claim_id: str, record: dict[str, Any]) -> str:
     return f"{claim_id}  approve  {money}"
 
 
-def work_claim(claim_id: str, graph: Any, thread_id: str | None = None) -> str:
+def work_claim(
+    claim_id: str,
+    graph: Any,
+    thread_id: str | None = None,
+    run_id: str | None = None,
+) -> str:
     """Start one new claim attempt and run its graph."""
     record = api.get_agent_claim(claim_id)
     if record["decision"] is not None:
-        return carry_on(claim_id, graph)
+        return carry_on(claim_id, graph, run_id)
     if record["status"] != "in progress":
         raise RuntimeError("Claim is not in progress")
     selected_thread = thread_id or _thread_id(claim_id, record)
@@ -270,6 +279,7 @@ def work_claim(claim_id: str, graph: Any, thread_id: str | None = None) -> str:
         claim_id,
         selected_thread,
         "Work claim",
+        run_id,
     )
     saved = api.get_agent_claim(claim_id)
     if saved["decision"] is None:
@@ -334,7 +344,7 @@ def _resume_input(
     return False, None
 
 
-def carry_on(claim_id: str, graph: Any) -> str:
+def carry_on(claim_id: str, graph: Any, run_id: str | None = None) -> str:
     """Resume one stopped or signed-off claim from its saved checkpoint."""
     record = api.get_agent_claim(claim_id)
     if record["status"] != "in progress" and record["thread_id"] is None:
@@ -350,8 +360,8 @@ def carry_on(claim_id: str, graph: Any) -> str:
         current_context.run(
             lambda: graph.invoke(
                 value,
-                _config(claim_id, thread_id, "Carry on"),
-                context={"claim_id": claim_id},
+                _config(claim_id, thread_id, "Carry on", run_id),
+                context={"claim_id": claim_id, "run_id": run_id},
                 durability="sync",
             )
         )
@@ -361,6 +371,15 @@ def carry_on(claim_id: str, graph: Any) -> str:
             raise
         logger.exception("Could not carry claim %s to completion", claim_id)
     return claim_report(claim_id, api.get_agent_claim(claim_id))
+
+
+def work_in_run(claim_id: str, run_id: str, new_graph: Callable[[], Any]) -> str:
+    """Start or resume one claim using its own graph and the dispatch id."""
+    record = api.get_agent_claim(claim_id)
+    graph = new_graph()
+    if record["decision"] is not None:
+        return carry_on(claim_id, graph, run_id)
+    return work_claim(claim_id, graph, record["thread_id"], run_id)
 
 
 @tool

@@ -850,7 +850,14 @@ def list_claim_records() -> list[dict[str, Any]]:
     """Return source claim records with their current workflow state."""
     with connection() as db:
         rows = db.execute(claim_view.order_by(claims_table.c.claim_id)).fetchall()
-    return [claim_record(row) for row in rows]
+    records = [claim_record(row) for row in rows]
+    return sorted(
+        records,
+        key=lambda record: (
+            record["claim"].get("submitted_at", ""),
+            record["claim"]["claim_id"],
+        ),
+    )
 
 
 def get_claim_record(claim_id: str) -> dict[str, Any] | None:
@@ -1240,7 +1247,17 @@ def get_run(run_id: str) -> dict[str, Any] | None:
             "WHERE run_id = ? ORDER BY position",
             (run_id,),
         ).fetchall()
-    return {**dict(row), "todos": [dict(todo) for todo in todos]}
+        claims = db.execute(
+            "SELECT claim_id FROM run_claims WHERE run_id = ? ORDER BY position",
+            (run_id,),
+        ).fetchall()
+    run = dict(row)
+    run["agents"] = run["max_claims"]
+    return {
+        **run,
+        "claim_ids": [claim["claim_id"] for claim in claims],
+        "todos": [dict(todo) for todo in todos],
+    }
 
 
 def get_current_run() -> dict[str, Any] | None:
@@ -1296,14 +1313,39 @@ def create_evaluation(  # noqa: PLR0913, PLR0917
 
 
 def record_run_claims(run_id: str, claim_ids: list[str]) -> None:
-    """Persist the in-order claims that a run is working."""
+    """Reserve and persist the in-order claims that a dispatch is working."""
     with connection() as db:
+        db.execute("BEGIN IMMEDIATE")
+        run = db.execute(
+            "SELECT status FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if run is None:
+            raise KeyError(run_id)
+        if run["status"] != "in progress":
+            raise ValueError("Run is not active")
+        if len(set(claim_ids)) != len(claim_ids):
+            raise ValueError("A claim can only be selected once")
+        db.execute("DELETE FROM run_claims WHERE run_id = ?", (run_id,))
         for position, claim_id in enumerate(claim_ids):
+            claim = db.execute(
+                "SELECT status FROM claims WHERE claim_id = ?", (claim_id,)
+            ).fetchone()
+            if claim is None:
+                raise KeyError(claim_id)
+            if claim["status"] not in {"waiting", "in progress"}:
+                raise ValueError(f"Claim {claim_id} is not available for dispatch")
             db.execute(
-                "INSERT OR REPLACE INTO run_claims "
-                "(run_id, claim_id, position) VALUES (?, ?, ?)",
+                "UPDATE claims SET status = 'in progress', run_id = ?, "
+                "thread_id = CASE WHEN status = 'waiting' "
+                "THEN NULL ELSE thread_id END, "
+                "lease_at = CURRENT_TIMESTAMP WHERE claim_id = ?",
+                (run_id, claim_id),
+            )
+            db.execute(
+                "INSERT INTO run_claims (run_id, claim_id, position) VALUES (?, ?, ?)",
                 (run_id, claim_id, position),
             )
+        touch_run(db, run_id)
 
 
 def finish_run_summary(run_id: str, summary: str) -> None:

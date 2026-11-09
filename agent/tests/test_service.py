@@ -105,6 +105,62 @@ def test_service_run_route_reports_missing_and_non_active_runs(
     assert conflict.status_code == 409
 
 
+def test_dispatch_start_persists_claims_runs_graph_and_releases_lock(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    created: list[tuple[str, int, str, str]] = []
+    selected: list[tuple[str, list[str]]] = []
+    dispatched: list[dict[str, Any]] = []
+
+    def create_dispatch(
+        run_id: str, agents: int, model: str, reasoning_effort: str
+    ) -> dict[str, Any]:
+        created.append((run_id, agents, model, reasoning_effort))
+        return {"run_id": run_id, "agents": agents}
+
+    monkeypatch.setattr(service.api, "create_dispatch", create_dispatch)
+    monkeypatch.setattr(
+        service.api,
+        "get_dispatch_claims",
+        lambda: [
+            {"claim_id": "CLM-1001", "status": "waiting"},
+            {"claim_id": "CLM-1002", "status": "in progress"},
+            {"claim_id": "CLM-1003", "status": "decided"},
+        ],
+    )
+    monkeypatch.setattr(
+        service.api,
+        "record_run_claims",
+        lambda run_id, claim_ids: selected.append((run_id, claim_ids)),
+    )
+    monkeypatch.setattr(
+        service.dispatcher,
+        "work_run",
+        lambda run, work, resuming: dispatched.append(run) or [],
+    )
+
+    response = client.post("/api/dispatches", json={"agents": 2})
+
+    assert response.status_code == 202
+    assert response.json() == {"status": "accepted", "agents": 2}
+    assert created[0][1:] == (2, "openai/gpt-6-luna", "low")
+    assert selected == [(created[0][0], ["CLM-1001", "CLM-1002"])]
+    assert dispatched[0]["claim_ids"] == ["CLM-1001", "CLM-1002"]
+    assert dispatched[0]["agents"] == 2
+    assert not service.app.state.run_lock.locked()
+
+
+def test_dispatch_start_rejects_an_active_run(client: TestClient):
+    service.app.state.run_lock.acquire()
+    try:
+        response = client.post("/api/dispatches", json={"agents": 2})
+    finally:
+        service.app.state.run_lock.release()
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "A dispatch or an evaluation is already running"
+
+
 def test_background_service_logs_failures(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ):

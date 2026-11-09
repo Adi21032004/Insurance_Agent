@@ -1,7 +1,7 @@
 """Claim tools backed by the UnderCover HTTP API."""
 
 import json
-from typing import Annotated, Literal, TypedDict
+from typing import Annotated, Literal, NotRequired, TypedDict
 
 from langchain.tools import ToolRuntime, tool
 from langchain_core.messages import ToolMessage
@@ -15,6 +15,7 @@ class ClaimContext(TypedDict):
     """The claim id supplied to a graph run, never chosen by the model."""
 
     claim_id: str
+    run_id: NotRequired[str | None]
 
 
 Source = Literal["policy_wording", "claims_manual"]

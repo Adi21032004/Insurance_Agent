@@ -8,11 +8,9 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from langchain_core.runnables import RunnableConfig
 from sqlalchemy import JSON, inspect
 from sqlalchemy.pool import NullPool, QueuePool
 
-from agent import dispatcher as swarm_dispatcher
 from backend import database, dependencies, lookups, main, runs, views
 from backend.main import app
 
@@ -125,6 +123,47 @@ def test_current_run_is_null_when_no_run_is_active(client: TestClient):
 
     assert response.status_code == 200
     assert response.json() == {"run": None}
+
+
+def test_dispatch_claim_selection_reserves_claims_and_preserves_order(
+    client: TestClient,
+):
+    database.create_dispatch("dispatch-selection", 2, "model", "low")
+
+    response = client.put(
+        "/api/runs/dispatch-selection/claims",
+        json={"claim_ids": ["CLM-1002", "CLM-1001"]},
+    )
+    run = database.get_run("dispatch-selection")
+    queue = {
+        claim["claim_id"]: claim["status"]
+        for claim in client.get("/api/claims").json()["claims"]
+    }
+
+    assert response.status_code == 200
+    assert run is not None
+    assert run["claim_ids"] == ["CLM-1002", "CLM-1001"]
+    assert queue["CLM-1002"] == "in progress"
+    assert queue["CLM-1001"] == "in progress"
+
+
+def test_dispatch_claim_selection_rejects_unknown_claim_without_partial_updates(
+    client: TestClient,
+):
+    database.create_dispatch("dispatch-invalid-selection", 2, "model", "low")
+
+    response = client.put(
+        "/api/runs/dispatch-invalid-selection/claims",
+        json={"claim_ids": ["CLM-1001", "CLM-9999"]},
+    )
+    queue = {
+        claim["claim_id"]: claim["status"]
+        for claim in client.get("/api/claims").json()["claims"]
+    }
+
+    assert response.status_code == 404
+    assert queue["CLM-1001"] == "waiting"
+    assert required_run("dispatch-invalid-selection")["claim_ids"] == []
 
 
 def test_only_one_run_can_be_active_and_conflict_returns_run_id(
@@ -427,41 +466,6 @@ def test_swarm_dispatcher_and_helpers_cover_new_modules(
 ):
     monkeypatch.setattr(database, "DATABASE_PATH", tmp_path / "swarm.sqlite3")
 
-    def fake_run(run_id: str) -> dict[str, Any] | None:
-        if run_id == "dispatch-1":
-            return {"run_id": run_id, "status": "running", "todos": []}
-        return None
-
-    monkeypatch.setattr(database, "get_run", fake_run)
-    monkeypatch.setattr(database, "list_waiting_claim_ids", lambda limit: ["CLM-1001"])
-    monkeypatch.setattr(database, "finish_run", lambda run_id, summary: None)
-
-    config: RunnableConfig = {
-        "configurable": {
-            "run": {"run_id": "dispatch-1"},
-            "claim_id": "CLM-1001",
-            "work": lambda claim_id, run_id: f"{claim_id}:{run_id}",
-        }
-    }
-    assert swarm_dispatcher.list_claims(
-        {"claims": [], "reports": []},
-        {"configurable": {"run": {"run_id": "dispatch-1"}}},
-    ) == {"claims": ["CLM-1001"]}
-    assert swarm_dispatcher.finish_run(
-        {"claims": [], "reports": ["done"]},
-        {"configurable": {"run": {"run_id": "dispatch-1"}}},
-    ) == {"reports": ["done"]}
-    assert swarm_dispatcher.work_claim({"claims": [], "reports": []}, config) == {
-        "reports": ["CLM-1001:dispatch-1"]
-    }
-    graph = swarm_dispatcher.build_graph(
-        lambda claim_id, run_id: f"{claim_id}:{run_id}"
-    )
-    assert hasattr(graph, "work")
-    assert swarm_dispatcher.work_run(
-        {"run_id": "dispatch-1"}, lambda claim_id, run_id: f"{claim_id}:{run_id}"
-    ) == ["CLM-1001:dispatch-1"]
-
     assert dependencies.get_db() is not None
     assert (
         views.to_claim(
@@ -512,6 +516,29 @@ def test_swarm_run_routes_cover_dispatch_and_evaluation_operations(
     response = client.post("/api/dispatches", json={"agents": 5})
     assert response.status_code == 202
     assert response.json() == {"status": "accepted", "agents": 5}
+
+    monkeypatch.setattr(
+        runs.agent_service,
+        "start_dispatch",
+        lambda agents: (_ for _ in ()).throw(
+            runs.agent_service.AgentServiceConflict(
+                "A dispatch or an evaluation is already running"
+            )
+        ),
+    )
+    response = client.post("/api/dispatches", json={"agents": 5})
+    assert response.status_code == 409
+    assert response.json()["detail"] == "A dispatch or an evaluation is already running"
+
+    monkeypatch.setattr(
+        runs.agent_service,
+        "start_dispatch",
+        lambda agents: (_ for _ in ()).throw(
+            RuntimeError("The agent's service isn't running")
+        ),
+    )
+    response = client.post("/api/dispatches", json={"agents": 5})
+    assert response.status_code == 503
 
     monkeypatch.setattr(
         runs.agent_service,
@@ -570,7 +597,12 @@ def test_swarm_run_routes_cover_dispatch_and_evaluation_operations(
 
     response = client.post(
         "/api/runs/dispatches",
-        json={"agents": 2, "model": "openai/gpt-6-luna", "reasoning_effort": "low"},
+        json={
+            "run_id": "dispatch-1",
+            "agents": 2,
+            "model": "openai/gpt-6-luna",
+            "reasoning_effort": "low",
+        },
     )
     assert response.status_code == 200
     run_id = response.json()["run_id"]

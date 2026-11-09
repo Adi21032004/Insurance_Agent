@@ -9,6 +9,10 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
+class AgentServiceConflict(RuntimeError):
+    """Raised when the agent service refuses overlapping work."""
+
+
 def agent_url() -> str:
     """Return the configured agent service address."""
     return os.getenv("UNDERCOVER_AGENT", "http://127.0.0.1:8002")
@@ -43,6 +47,11 @@ def start_dispatch(agents: int) -> dict[str, Any]:
     try:
         response = post_agent("/api/dispatches", {"agents": agents})
         return response.json()
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code == httpx.codes.CONFLICT:
+            detail = error.response.json().get("detail", "A run is already active")
+            raise AgentServiceConflict(str(detail)) from error
+        raise RuntimeError("The agent's service isn't running") from error
     except httpx.HTTPError as error:
         raise RuntimeError("The agent's service isn't running") from error
 
@@ -55,5 +64,10 @@ def start_evaluation(evaluation_set: str, tiny: bool, agents: int) -> dict[str, 
             {"evaluation_set": evaluation_set, "tiny": tiny, "agents": agents},
         )
         return response.json()
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code == httpx.codes.CONFLICT:
+            detail = error.response.json().get("detail", "A run is already active")
+            raise AgentServiceConflict(str(detail)) from error
+        raise RuntimeError("The agent's service isn't running") from error
     except httpx.HTTPError as error:
         raise RuntimeError("The agent's service isn't running") from error
