@@ -134,8 +134,13 @@ def record_run_claims(run_id: str, body: RunClaimInput) -> dict[str, Any]:
 @router.post("/api/runs/{run_id}/finish", operation_id="finish_run")
 def finish_run(run_id: str, body: FinishRunInput) -> dict[str, Any]:
     """Finish a run and save its summary."""
-    database.finish_run_summary(run_id, body.summary)
-    return {"run_id": run_id, "status": "finished", "summary": body.summary}
+    run = database.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run["status"] not in {"running", "in progress"}:
+        raise HTTPException(status_code=409, detail="Run is not active")
+    summary = database.finish_run_summary(run_id, body.summary) or body.summary
+    return {"run_id": run_id, "status": "finished", "summary": summary}
 
 
 @router.post("/api/runs/stop", operation_id="stop_runs")

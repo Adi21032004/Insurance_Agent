@@ -166,6 +166,33 @@ def test_dispatch_claim_selection_rejects_unknown_claim_without_partial_updates(
     assert required_run("dispatch-invalid-selection")["claim_ids"] == []
 
 
+def test_dispatch_finish_builds_summary_and_cost_time_totals_from_records(
+    client: TestClient,
+):
+    run_id = "dispatch-summary"
+    database.create_dispatch(run_id, 1, "model", "low")
+    database.record_run_claims(run_id, ["CLM-1001"])
+    database.record_model_call("CLM-1001", 10, 4, 0.125, run_id)
+    database.record_work_time("CLM-1001", 0.75, run_id)
+
+    summary = database.finish_run_summary(run_id, "caller summary")
+    run = required_run(run_id)
+
+    assert summary == {
+        "approved": 0,
+        "declined": 0,
+        "referred": 0,
+        "waiting_for_sign_off": [],
+        "left_for_handler": [],
+        "unfinished": ["CLM-1001"],
+    }
+    assert run["status"] == "finished"
+    assert run["model_cost"] == pytest.approx(0.125)
+    assert run["seconds"] == pytest.approx(0.75)
+    assert run["claims"][0]["model_cost"] == pytest.approx(0.125)
+    assert run["claims"][0]["seconds"] == pytest.approx(0.75)
+
+
 def test_only_one_run_can_be_active_and_conflict_returns_run_id(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ):
@@ -583,6 +610,9 @@ def test_swarm_run_routes_cover_dispatch_and_evaluation_operations(
     )
     monkeypatch.setattr(database, "record_run_claims", lambda run_id, claim_ids: None)
     monkeypatch.setattr(database, "finish_run_summary", lambda run_id, summary: None)
+    monkeypatch.setattr(
+        database, "get_run", lambda run_id: {"run_id": run_id, "status": "running"}
+    )
     monkeypatch.setattr(
         database,
         "get_latest_dispatch",

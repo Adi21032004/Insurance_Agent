@@ -171,3 +171,57 @@ def test_decision_and_payment_api_replays_are_idempotent(client: TestClient):
     assert payments == 1
     assert signoffs == 1
     assert over_limit_payments == 1
+
+
+def test_model_usage_and_work_time_are_recorded_on_the_dispatch(
+    client: TestClient,
+):
+    run_id = "metric-dispatch"
+    database.create_dispatch(run_id, 1, "model", "low")
+    database.record_run_claims(run_id, ["CLM-1001"])
+
+    model_response = client.post(
+        "/api/claims/CLM-1001/model-calls",
+        json={
+            "run_id": run_id,
+            "input_tokens": 1200,
+            "output_tokens": 300,
+            "cost": 0.0042,
+        },
+    )
+    time_response = client.post(
+        "/api/claims/CLM-1001/work-times",
+        json={"run_id": run_id, "seconds": 12.5},
+    )
+    run = database.get_run(run_id)
+    assert run is not None
+
+    assert model_response.status_code == 200
+    assert time_response.status_code == 200
+    assert run["claims"][0]["model_cost"] == pytest.approx(0.0042)
+    assert run["claims"][0]["seconds"] == pytest.approx(12.5)
+
+
+def test_model_usage_and_work_time_reject_unknown_or_unstarted_records(
+    client: TestClient,
+):
+    payload = {
+        "run_id": None,
+        "input_tokens": 1,
+        "output_tokens": 1,
+        "cost": 0.01,
+    }
+
+    assert (
+        client.post("/api/claims/CLM-9999/model-calls", json=payload).status_code == 404
+    )
+    assert (
+        client.post("/api/claims/CLM-1001/model-calls", json=payload).status_code == 409
+    )
+    assert (
+        client.post(
+            "/api/claims/CLM-1001/work-times",
+            json={"run_id": None, "seconds": -1},
+        ).status_code
+        == 422
+    )

@@ -1248,14 +1248,65 @@ def get_run(run_id: str) -> dict[str, Any] | None:
             (run_id,),
         ).fetchall()
         claims = db.execute(
-            "SELECT claim_id FROM run_claims WHERE run_id = ? ORDER BY position",
+            "SELECT claim_id, started_at, seconds, model_cost "
+            "FROM run_claims WHERE run_id = ? ORDER BY position",
             (run_id,),
         ).fetchall()
+        claim_records = []
+        for item in claims:
+            claim_row = db.execute(
+                claim_view.where(claims_table.c.claim_id == item["claim_id"])
+            ).fetchone()
+            if claim_row is None:
+                continue
+            record = claim_record(claim_row)
+            claim_cost = db.execute(
+                "SELECT COALESCE(SUM(cost), 0) AS cost FROM model_calls "
+                "WHERE claim_id = ?",
+                (item["claim_id"],),
+            ).fetchone()
+            claim_records.append(
+                {
+                    "claim_id": item["claim_id"],
+                    "status": record["status"],
+                    "decision": record["decision"],
+                    "payout_inr": (
+                        record["decision"]["payout_inr"]
+                        if record["decision"] is not None
+                        else None
+                    ),
+                    "started_at": item["started_at"],
+                    "seconds": item["seconds"],
+                    "model_cost": item["model_cost"] or 0.0,
+                    "model_cost_total": claim_cost["cost"] if claim_cost else 0.0,
+                }
+            )
+        totals = db.execute(
+            "SELECT COALESCE(SUM(cost), 0) AS cost FROM model_calls WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        work = db.execute(
+            "SELECT COALESCE(SUM(seconds), 0) AS seconds FROM work_times "
+            "WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
     run = dict(row)
     run["agents"] = run["max_claims"]
+    if run["run_type"] == "dispatch" or run["kind"] == "dispatch":
+        run["status"] = {
+            "in progress": "running",
+            "completed": "finished",
+            "interrupted": "stopped",
+            "stopped": "stopped",
+        }.get(run["status"], run["status"])
+        if run["summary"] is not None:
+            run["summary"] = json.loads(run["summary"])
     return {
         **run,
         "claim_ids": [claim["claim_id"] for claim in claims],
+        "claims": claim_records,
+        "model_cost": totals["cost"] if totals else 0.0,
+        "seconds": work["seconds"] if work else 0.0,
         "todos": [dict(todo) for todo in todos],
     }
 
@@ -1348,9 +1399,43 @@ def record_run_claims(run_id: str, claim_ids: list[str]) -> None:
         touch_run(db, run_id)
 
 
-def finish_run_summary(run_id: str, summary: str) -> None:
-    """Finish a run and save its summary."""
+def finish_run_summary(run_id: str, summary: str) -> Any:
+    """Finish a dispatch with its summary built from persisted claim records."""
+    run = get_run(run_id)
+    if run is None:
+        raise KeyError(run_id)
+    if run.get("kind") == "dispatch" or run["run_type"] == "dispatch":
+        claims = run["claims"]
+        counts = {
+            outcome: sum(
+                item["decision"] is not None and item["decision"]["outcome"] == outcome
+                for item in claims
+            )
+            for outcome in ("approve", "decline", "refer")
+        }
+        dispatch_summary = {
+            "approved": counts["approve"],
+            "declined": counts["decline"],
+            "referred": counts["refer"],
+            "waiting_for_sign_off": [
+                {"claim_id": item["claim_id"], "payout": item["payout_inr"]}
+                for item in claims
+                if item["status"] == "waiting for sign-off"
+            ],
+            "left_for_handler": [
+                item["claim_id"] for item in claims if item["status"] == "needs handler"
+            ],
+            "unfinished": [
+                item["claim_id"]
+                for item in claims
+                if item["status"] in {"waiting", "in progress"}
+            ],
+        }
+        summary = json.dumps(dispatch_summary)
+    else:
+        dispatch_summary = None
     finish_run(run_id, summary)
+    return dispatch_summary if dispatch_summary is not None else summary
 
 
 def stop_runs() -> list[str]:
@@ -1422,6 +1507,15 @@ def record_model_call(  # noqa: PLR0913, PLR0917
             is None
         ):
             raise KeyError(run_id)
+        if (
+            run_id is not None
+            and db.execute(
+                "SELECT 1 FROM run_claims WHERE run_id = ? AND claim_id = ?",
+                (run_id, claim_id),
+            ).fetchone()
+            is None
+        ):
+            raise ValueError("Claim is not recorded for this run")
         db.execute(
             "INSERT INTO model_calls (claim_id, thread_id, run_id, "
             "input_tokens, output_tokens, cost, recorded_at) "
@@ -1435,6 +1529,12 @@ def record_model_call(  # noqa: PLR0913, PLR0917
                 cost,
             ),
         )
+        if run_id is not None:
+            db.execute(
+                "UPDATE run_claims SET model_cost = COALESCE(model_cost, 0) + ? "
+                "WHERE run_id = ? AND claim_id = ?",
+                (cost, run_id, claim_id),
+            )
 
 
 def record_work_time(
@@ -1447,7 +1547,9 @@ def record_work_time(
     """Record a claim work spell with duration and optional run metadata."""
     if seconds < 0:
         raise ValueError("Seconds cannot be negative")
-    recorded = started_at or datetime.now(UTC).isoformat()
+    recorded = (
+        started_at or (datetime.now(UTC) - timedelta(seconds=seconds)).isoformat()
+    )
     with connection() as db:
         claim = db.execute(
             "SELECT status, thread_id FROM claims WHERE claim_id = ?", (claim_id,)
@@ -1462,11 +1564,28 @@ def record_work_time(
             is None
         ):
             raise KeyError(run_id)
+        if (
+            run_id is not None
+            and db.execute(
+                "SELECT 1 FROM run_claims WHERE run_id = ? AND claim_id = ?",
+                (run_id, claim_id),
+            ).fetchone()
+            is None
+        ):
+            raise ValueError("Claim is not recorded for this run")
         db.execute(
             "INSERT INTO work_times (claim_id, thread_id, run_id, "
             "started_at, seconds) VALUES (?, ?, ?, ?, ?)",
             (claim_id, thread_id or claim["thread_id"], run_id, recorded, seconds),
         )
+        if run_id is not None:
+            db.execute(
+                "UPDATE run_claims SET started_at = CASE "
+                "WHEN started_at IS NULL OR started_at > ? THEN ? "
+                "ELSE started_at END, seconds = COALESCE(seconds, 0) + ? "
+                "WHERE run_id = ? AND claim_id = ?",
+                (recorded, recorded, seconds, run_id, claim_id),
+            )
 
 
 def set_todo_status(todo_id: int, status: str) -> None:
