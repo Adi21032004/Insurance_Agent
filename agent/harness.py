@@ -130,8 +130,8 @@ def pay_claim(state: ClaimState, runtime: Runtime[ClaimContext]) -> dict[str, st
 
 
 @contextmanager
-def checkpointer() -> Iterator[Any]:
-    """Open the shared Postgres checkpoint saver, or memory for local tests."""
+def checkpoint_pool() -> Iterator[Any]:
+    """Open a shared checkpoint pool, or memory for local tests."""
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         yield InMemorySaver()
@@ -143,6 +143,7 @@ def checkpointer() -> Iterator[Any]:
         conninfo=dsn,
         min_size=1,
         max_size=4,
+        timeout=120,
         kwargs={
             "autocommit": True,
             "prepare_threshold": 0,
@@ -153,11 +154,20 @@ def checkpointer() -> Iterator[Any]:
     )
     pool.open(wait=True)
     try:
-        saver = PostgresSaver(pool)
-        saver.setup()
-        yield saver
+        PostgresSaver(pool).setup()
+        yield pool
     finally:
         pool.close()
+
+
+def claim_graphs(pool: Any) -> Callable[[str], Any]:
+    """Build claim graphs with separate Postgres savers on the shared pool."""
+
+    def new_graph(claim_id: str) -> Any:
+        saver = PostgresSaver(pool) if isinstance(pool, ConnectionPool) else pool
+        return build_claim_graph(model(claim_id), saver)
+
+    return new_graph
 
 
 def model(claim_id: str | None = None) -> BaseChatModel:

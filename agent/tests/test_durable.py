@@ -1,4 +1,5 @@
 from collections.abc import Iterator
+from contextlib import nullcontext
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,8 @@ from agent import api, harness
 from agent.harness import (
     build_claim_graph,
     carry_on,
-    checkpointer,
+    checkpoint_pool,
+    claim_graphs,
     process_saved_run,
     run_queue,
     work_claim,
@@ -469,13 +471,65 @@ def test_agent_api_operations_cover_claim_knowledge_payout_and_runs(
     assert api.get_run(named_run_id)["status"] == "interrupted"
 
 
-def test_checkpointer_uses_memory_without_a_database_url(
+def test_checkpoint_pool_uses_memory_without_a_database_url(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.delenv("DATABASE_URL", raising=False)
 
-    with checkpointer() as saver:
-        assert isinstance(saver, InMemorySaver)
+    with checkpoint_pool() as pool:
+        assert isinstance(pool, InMemorySaver)
+
+
+def test_checkpoint_pool_shares_connections_but_builds_a_saver_per_claim(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class Pool:
+        def __init__(self, **options: Any):
+            self.options = options
+            self.opened = False
+            self.closed = False
+
+        def open(self, wait: bool):
+            self.opened = wait
+
+        def close(self):
+            self.closed = True
+
+    class Connection:
+        def execute(self, query: str):
+            assert query == "CREATE SCHEMA IF NOT EXISTS undercover"
+
+    class Saver:
+        def __init__(self, pool: Pool):
+            self.pool = pool
+
+        def setup(self):
+            return None
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://user:pass@localhost/db")
+    monkeypatch.setattr("agent.harness.ConnectionPool", Pool)
+    monkeypatch.setattr("agent.harness.PostgresSaver", Saver)
+    monkeypatch.setattr(
+        "agent.harness.psycopg.connect",
+        lambda *args, **kwargs: nullcontext(Connection()),
+    )
+    monkeypatch.setattr("agent.harness.model", lambda claim_id: claim_id)
+    monkeypatch.setattr("agent.harness.build_claim_graph", lambda model, saver: saver)
+
+    with checkpoint_pool() as pool:
+        assert pool.opened
+        assert pool.options["min_size"] == 1
+        assert pool.options["max_size"] == 4
+        assert pool.options["timeout"] == 120
+        make_graph = claim_graphs(pool)
+        first = make_graph("CLM-1001")
+        second = make_graph("CLM-1002")
+        assert isinstance(first, Saver)
+        assert isinstance(second, Saver)
+        assert first is not second
+        assert first.pool is pool
+        assert second.pool is pool
+    assert pool.closed
 
 
 def test_run_queue_carries_saved_work_before_an_empty_queue(

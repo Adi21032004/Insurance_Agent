@@ -6,24 +6,17 @@ import pytest
 from agent import __main__ as cli
 
 
-def test_cli_runs_a_capped_queue_without_loading_environment(
+def test_cli_requires_a_claim_id(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ):
-    calls: list[tuple[int, str, str]] = []
     monkeypatch.setattr(cli, "load_dotenv", lambda: None)
-    monkeypatch.setattr(cli, "checkpointer", lambda: nullcontext("saver"))
-    monkeypatch.setattr(cli, "model", lambda: "model")
-    monkeypatch.setattr(
-        cli,
-        "run_queue",
-        lambda cap, llm, saver: calls.append((cap, llm, saver)) or "queue done",
-    )
-    monkeypatch.setattr(sys, "argv", ["agent", "--cap", "3"])
+    monkeypatch.setattr(sys, "argv", ["agent"])
 
-    cli.main()
+    with pytest.raises(SystemExit) as error:
+        cli.main()
 
-    assert calls == [(3, "model", "saver")]
-    assert capsys.readouterr().out.strip() == "queue done"
+    assert error.value.code == 2
+    assert "the following arguments are required: claim_id" in capsys.readouterr().err
 
 
 def test_cli_runs_one_named_claim(
@@ -31,7 +24,7 @@ def test_cli_runs_one_named_claim(
 ):
     calls: list[tuple[str, str]] = []
     monkeypatch.setattr(cli, "load_dotenv", lambda: None)
-    monkeypatch.setattr(cli, "checkpointer", lambda: nullcontext("saver"))
+    monkeypatch.setattr(cli, "checkpoint_pool", lambda: nullcontext("pool"))
     monkeypatch.setattr(
         cli,
         "run_claim_direct",
@@ -41,5 +34,5 @@ def test_cli_runs_one_named_claim(
 
     cli.main()
 
-    assert calls == [("CLM-1001", "saver")]
+    assert calls == [("CLM-1001", "pool")]
     assert capsys.readouterr().out.strip() == "claim done"

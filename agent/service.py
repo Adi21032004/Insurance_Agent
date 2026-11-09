@@ -12,11 +12,9 @@ from pydantic import BaseModel, Field
 
 from agent import api, dispatcher
 from agent.harness import (
-    build_claim_graph,
     carry_on,
-    checkpointer,
-    model,
-    process_saved_run,
+    checkpoint_pool,
+    claim_graphs,
     work_in_run,
 )
 
@@ -38,19 +36,19 @@ async def lifespan(app: FastAPI):
     """Keep one checkpoint pool open for the life of this process."""
     app.state.run_lock = threading.Lock()
     app.state.resuming = set()
-    with checkpointer() as saver:
-        app.state.checkpointer = saver
+    with checkpoint_pool() as pool:
+        app.state.checkpoint_pool = pool
         yield
 
 
 app = FastAPI(title="UnderCover Agent", lifespan=lifespan)
 
 
-def resume_in_background(claim_id: str, saver: Any) -> None:
+def resume_in_background(claim_id: str, pool: Any) -> None:
     """Carry a signed-off claim on without holding the handler response."""
     try:
         api.get_agent_claim(claim_id)
-        graph = build_claim_graph(model(claim_id), saver)
+        graph = claim_graphs(pool)(claim_id)
         logger.info(carry_on(claim_id, graph))
     except Exception:
         logger.exception("Could not resume signed-off claim %s", claim_id)
@@ -58,15 +56,7 @@ def resume_in_background(claim_id: str, saver: Any) -> None:
         app.state.resuming.discard(claim_id)
 
 
-def run_in_background(run_id: str, saver: Any) -> None:
-    """Run a persisted queue in the service process."""
-    try:
-        logger.info(process_saved_run(run_id, saver))
-    except Exception:
-        logger.exception("Agent run %s did not finish", run_id)
-
-
-def dispatch_in_background(agents: int, saver: Any) -> None:
+def dispatch_in_background(agents: int, pool: Any) -> None:
     """Create and execute one dispatch with bounded parallel claim workers."""
     run_id: str | None = None
     try:
@@ -84,12 +74,11 @@ def dispatch_in_background(agents: int, saver: Any) -> None:
         api.record_run_claims(run_id, claim_ids)
         run.update({"agents": agents, "claim_ids": claim_ids})
         resuming = set(app.state.resuming)
+        new_graph = claim_graphs(pool)
         reports = dispatcher.work_run(
             run,
             lambda claim_id, active_run_id: work_in_run(
-                claim_id,
-                active_run_id,
-                lambda: build_claim_graph(model(claim_id), saver),
+                claim_id, active_run_id, lambda: new_graph(claim_id)
             ),
             resuming,
         )
@@ -109,7 +98,7 @@ def evaluation_in_background(
     evaluation_set: Literal["evaluation", "held_out"],
     tiny: bool,
     agents: int,
-    saver: Any,
+    pool: Any,
 ) -> None:
     """Create and execute an evaluation on backend-owned labelled copies."""
     run_id: str | None = None
@@ -131,12 +120,11 @@ def evaluation_in_background(
                 "The backend did not return an evaluation and its claims"
             )
         run.update({"agents": agents, "claim_ids": claim_ids})
+        new_graph = claim_graphs(pool)
         reports = dispatcher.work_run(
             run,
             lambda claim_id, active_run_id: work_in_run(
-                claim_id,
-                active_run_id,
-                lambda: build_claim_graph(model(claim_id), saver),
+                claim_id, active_run_id, lambda: new_graph(claim_id)
             ),
         )
         logger.info("Evaluation %s finished: %s", run_id, reports)
@@ -167,7 +155,7 @@ def start_dispatch(
             status_code=409, detail="A dispatch or an evaluation is already running"
         )
     background_tasks.add_task(
-        dispatch_in_background, request.agents, app.state.checkpointer
+        dispatch_in_background, request.agents, app.state.checkpoint_pool
     )
     return {"status": "accepted", "agents": request.agents}
 
@@ -186,7 +174,7 @@ def start_evaluation(
         request.evaluation_set,
         request.tiny,
         request.agents,
-        app.state.checkpointer,
+        app.state.checkpoint_pool,
     )
     return {
         "status": "accepted",
@@ -210,18 +198,5 @@ def resume_claim(claim_id: str, background_tasks: BackgroundTasks) -> dict[str, 
     if record["status"] != "in progress":
         raise HTTPException(status_code=409, detail="Claim is not in progress")
     app.state.resuming.add(claim_id)
-    background_tasks.add_task(resume_in_background, claim_id, app.state.checkpointer)
+    background_tasks.add_task(resume_in_background, claim_id, app.state.checkpoint_pool)
     return {"claim_id": claim_id, "status": "accepted"}
-
-
-@app.post("/api/runs/{run_id}/run", status_code=202, operation_id="run_saved_queue")
-def run_saved_queue(run_id: str, background_tasks: BackgroundTasks) -> dict[str, str]:
-    """Start one persisted queue run in the agent service."""
-    try:
-        run = api.get_run(run_id)
-    except Exception as error:
-        raise HTTPException(status_code=404, detail="Run not found") from error
-    if run["status"] != "in progress":
-        raise HTTPException(status_code=409, detail="Run is not in progress")
-    background_tasks.add_task(run_in_background, run_id, app.state.checkpointer)
-    return {"run_id": run_id, "status": "accepted"}
