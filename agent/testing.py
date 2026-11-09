@@ -7,7 +7,6 @@ from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage
 
 _TEST_FAILURE_ATTEMPTS: dict[str, int] = {}
-_MISSED_STUB_CLAIMS: set[str] = set()
 
 
 class StubModel(GenericFakeChatModel):
@@ -36,16 +35,6 @@ def stub_provider_failure() -> StubModel:
     return StubModel(messages=iter(()))
 
 
-def scheduled_stub_miss(claim_id: str) -> bool:
-    """Skip one selected claim when a browser check requests reconciliation."""
-    if os.getenv("UNDERCOVER_TEST_MISSED_CLAIM") != claim_id:
-        return False
-    if claim_id in _MISSED_STUB_CLAIMS:
-        return False
-    _MISSED_STUB_CLAIMS.add(claim_id)
-    return True
-
-
 def tool_message(name: str, args: dict[str, object], call_id: str) -> AIMessage:
     """Build one scripted tool call for the fake model."""
     return AIMessage(
@@ -55,7 +44,7 @@ def tool_message(name: str, args: dict[str, object], call_id: str) -> AIMessage:
 
 
 def stub_model(claim_id: str) -> StubModel:
-    """Return a fake model that approves the first queue claim."""
+    """Return a fake model that approves the requested claim."""
     payout_request = {
         "claim_id": claim_id,
         "benefit": "trip_delay",
@@ -133,28 +122,6 @@ def stub_model(claim_id: str) -> StubModel:
                     "The carrier notice and receipts support the claim."
                 )
             ),
-        ]
-    )
-    return StubModel(messages=messages)
-
-
-def stub_queue_model(
-    candidate_ids: list[str], max_claims: int, run_id: str
-) -> StubModel:
-    """Return a queue plan with a distinct order for capped-run tests."""
-    selected = list(reversed(candidate_ids[:max_claims]))
-    items = [
-        {"claim_id": claim_id, "description": f"Review {claim_id}"}
-        for claim_id in selected
-    ]
-    messages: Iterator[AIMessage] = iter(
-        [
-            tool_message(
-                "save_run_plan",
-                {"run_id": run_id, "items": items},
-                "queue-1",
-            ),
-            AIMessage(content="Queue plan saved."),
         ]
     )
     return StubModel(messages=messages)

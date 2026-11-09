@@ -149,14 +149,6 @@ def pay_claim(claim_id: str, amount_inr: float) -> dict[str, Any]:
     return response.json()
 
 
-def get_latest_run() -> dict[str, Any] | None:
-    """Read the current or most recently completed queue run."""
-    with backend() as client:
-        response = client.get("/api/agent/runs/latest")
-    response.raise_for_status()
-    return response.json()["run"]
-
-
 def get_agent_claim(claim_id: str) -> dict[str, Any]:
     """Read persisted agent workflow state for one claim."""
     with backend() as client:
@@ -165,35 +157,22 @@ def get_agent_claim(claim_id: str) -> dict[str, Any]:
     return response.json()
 
 
-def get_queue_claims() -> list[dict[str, Any]]:
-    """Read the current queue."""
+def get_dispatch_claims() -> list[dict[str, Any]]:
+    """Read claims eligible for a dispatch from the handler queue."""
     with backend() as client:
         response = client.get("/api/claims")
     response.raise_for_status()
-    return response.json()["claims"]
-
-
-def get_dispatch_claims() -> list[dict[str, Any]]:
-    """Read claims eligible for a dispatch from the handler queue."""
     return [
         claim
-        for claim in get_queue_claims()
+        for claim in response.json()["claims"]
         if claim["status"] in {"waiting", "in progress"}
     ]
 
 
 def get_instructions() -> dict[str, str]:
-    """Read both instruction sets from the backend."""
+    """Read the claim instructions from the backend."""
     with backend() as client:
         response = client.get("/api/instructions")
-    response.raise_for_status()
-    return response.json()
-
-
-def get_run(run_id: str) -> dict[str, Any]:
-    """Read one persisted run and its ordered work items."""
-    with backend() as client:
-        response = client.get(f"/api/agent/runs/{run_id}")
     response.raise_for_status()
     return response.json()
 
@@ -270,87 +249,6 @@ def start_claim_direct(claim_id: str) -> None:
     """Reserve one waiting claim for a direct claim-agent invocation."""
     with backend() as client:
         response = client.post(f"/api/claims/{claim_id}/run/direct")
-    response.raise_for_status()
-
-
-def create_direct_run(max_claims: int) -> str:
-    """Create a queue run that the current caller will process."""
-    with backend() as client:
-        response = client.post(
-            "/api/agent/runs/direct", json={"max_claims": max_claims}
-        )
-    response.raise_for_status()
-    return response.json()["run_id"]
-
-
-def create_direct_claim_run(claim_id: str) -> str:
-    """Create a named claim run for a local command."""
-    with backend() as client:
-        response = client.post(f"/api/claims/{claim_id}/run/direct")
-    response.raise_for_status()
-    return response.json()["run_id"]
-
-
-def select_run_claims(run_id: str, claim_ids: list[str]) -> None:
-    """Reserve claims in their selected order."""
-    with backend() as client:
-        response = client.post(
-            f"/api/agent/runs/{run_id}/select", json={"claim_ids": claim_ids}
-        )
-    response.raise_for_status()
-
-
-def plan_run_todos(run_id: str, items: list[dict[str, str]]) -> None:
-    """Persist the queue agent's ordered descriptions."""
-    with backend() as client:
-        response = client.put(f"/api/agent/runs/{run_id}/todos", json={"items": items})
-    response.raise_for_status()
-
-
-def update_run_todo(run_id: str, todo_id: int, status: str) -> None:
-    """Persist a queue work item's state."""
-    with backend() as client:
-        response = client.patch(
-            f"/api/agent/runs/{run_id}/todos/{todo_id}", json={"status": status}
-        )
-    response.raise_for_status()
-
-
-def fail_run_attempt(run_id: str, claim_id: str, detail: str) -> dict[str, Any]:
-    """Record a failed attempt and its retry state."""
-    with backend() as client:
-        response = client.post(
-            f"/api/agent/runs/{run_id}/claims/{claim_id}/failure",
-            json={"detail": detail},
-        )
-    response.raise_for_status()
-    return response.json()
-
-
-def retry_run_claim(run_id: str, claim_id: str, reason: str) -> int:
-    """Start another attempt for a selected claim."""
-    with backend() as client:
-        response = client.post(
-            f"/api/agent/runs/{run_id}/claims/{claim_id}/retry",
-            json={"reason": reason},
-        )
-    response.raise_for_status()
-    return int(response.json()["attempt"])
-
-
-def complete_run(run_id: str, summary: str) -> None:
-    """Save a run summary and close the run."""
-    with backend() as client:
-        response = client.post(
-            f"/api/agent/runs/{run_id}/complete", json={"summary": summary}
-        )
-    response.raise_for_status()
-
-
-def interrupt_run(run_id: str) -> None:
-    """Mark a stopped queue run as interrupted."""
-    with backend() as client:
-        response = client.post(f"/api/agent/runs/{run_id}/interrupt")
     response.raise_for_status()
 
 

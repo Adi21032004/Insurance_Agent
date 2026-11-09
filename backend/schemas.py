@@ -87,12 +87,6 @@ class PaymentInput(BaseModel):
     amount_inr: float = Field(ge=0)
 
 
-class RunStartInput(BaseModel):
-    """Maximum number of distinct waiting claims in a queue run."""
-
-    max_claims: int = Field(ge=1, le=25)
-
-
 class ThreadInput(BaseModel):
     """Thread identifier assigned to one claim attempt."""
 
@@ -113,49 +107,6 @@ class WorkTimeInput(BaseModel):
 
     run_id: str | None
     seconds: float = Field(ge=0)
-
-
-class RunTodoItemInput(BaseModel):
-    """One claim and description in the queue agent's work plan."""
-
-    claim_id: str = Field(min_length=1)
-    description: str = Field(min_length=1)
-
-
-class RunTodoPlanInput(BaseModel):
-    """Ordered queue agent work items for one run."""
-
-    items: list[RunTodoItemInput]
-
-
-class RunSelectionInput(BaseModel):
-    """Claim identifiers reserved for a run in the requested order."""
-
-    claim_ids: list[str]
-
-
-class RunCompleteInput(BaseModel):
-    """Short handler summary used to close one run."""
-
-    summary: str = Field(min_length=1)
-
-
-class RunAttemptFailureInput(BaseModel):
-    """One failed attempt and its short diagnostic detail."""
-
-    detail: str = Field(min_length=1)
-
-
-class RunRetryInput(BaseModel):
-    """Reason for retrying one claim within its active run."""
-
-    reason: str = Field(min_length=1)
-
-
-class RunTodoStatusInput(BaseModel):
-    """Allowed state for one queue run work item."""
-
-    status: Literal["to do", "in progress", "done", "left for handler"]
 
 
 class KnowledgeSearchInput(BaseModel):

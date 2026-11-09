@@ -9,7 +9,6 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, Protocol
-from uuid import uuid4
 
 from sqlalchemy import (
     JSON,
@@ -40,7 +39,6 @@ DATABASE_PATH = Path(
     )
 )
 RecordTable = Literal["decisions", "payments", "signoffs"]
-MAX_CLAIM_FAILURES = 2
 MAX_AGENTS = 25
 POSTGRES_CONNECT_ARGS = {"options": "-c search_path=undercover"}
 RECORD_SQL = {
@@ -212,19 +210,6 @@ handler_decisions_table = Table(
     Column("decision", String, nullable=False),
     Column("payout", Float, nullable=False),
     Column("tiny", Integer, nullable=False),
-)
-todos_table = Table(
-    "todos",
-    metadata,
-    Column("todo_id", Integer, primary_key=True, autoincrement=True),
-    Column("run_id", String, ForeignKey("runs.run_id"), nullable=False),
-    Column("position", Integer, nullable=False),
-    Column("claim_id", String, ForeignKey("claims.claim_id"), nullable=False),
-    Column("description", Text, nullable=False),
-    Column("status", String, nullable=False, server_default="to do"),
-    Column("attempt_count", Integer, nullable=False, server_default="0"),
-    UniqueConstraint("run_id", "position"),
-    UniqueConstraint("run_id", "claim_id"),
 )
 source_reads_table = Table(
     "source_reads",
@@ -443,7 +428,7 @@ def connection() -> Iterator[CoreConnection]:
 
 
 def touch_claim_lease(db: CoreConnection, claim_id: str) -> None:
-    """Refresh the run and claim heartbeat while claim work is active."""
+    """Refresh the active claim lease."""
     db.execute(
         "UPDATE claims SET lease_at = CURRENT_TIMESTAMP "
         "WHERE claim_id = ? AND run_id IS NOT NULL AND EXISTS ("
@@ -451,31 +436,6 @@ def touch_claim_lease(db: CoreConnection, claim_id: str) -> None:
         "AND runs.status = 'in progress')",
         (claim_id,),
     )
-    db.execute(
-        "UPDATE runs SET heartbeat_at = CURRENT_TIMESTAMP WHERE run_id = "
-        "(SELECT run_id FROM claims WHERE claim_id = ?)",
-        (claim_id,),
-    )
-
-
-def touch_run(db: CoreConnection, run_id: str) -> None:
-    """Refresh one persisted run heartbeat."""
-    db.execute(
-        "UPDATE runs SET heartbeat_at = CURRENT_TIMESTAMP WHERE run_id = ?",
-        (run_id,),
-    )
-
-
-def lease_has_expired(heartbeat_at: Any, created_at: Any, lease_seconds: int) -> bool:
-    """Check a persisted run heartbeat against the configured lease."""
-    value = heartbeat_at or created_at
-    timestamp = (
-        value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
-    )
-    if timestamp.tzinfo is None:
-        timestamp = timestamp.replace(tzinfo=UTC)
-    deadline = datetime.now(UTC) - timedelta(seconds=lease_seconds)
-    return timestamp <= deadline
 
 
 def read_json(filename: str) -> Any:
@@ -651,11 +611,6 @@ def ensure_workflow_columns(db: CoreConnection) -> None:
     ):
         if name not in run_columns:
             db.execute(f"ALTER TABLE runs ADD COLUMN {name} {declaration}")
-    todo_columns = {row[1] for row in db.execute("PRAGMA table_info(todos)").fetchall()}
-    if "attempt_count" not in todo_columns:
-        db.execute(
-            "ALTER TABLE todos ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"
-        )
 
 
 def initialize_database() -> None:
@@ -1223,135 +1178,12 @@ def create_run(run_id: str, run_type: str, max_claims: int) -> None:
             raise ValueError("Another agent run is already active") from error
 
 
-def list_waiting_claim_ids(limit: int) -> list[str]:
-    """Return up to the requested number of waiting claim identifiers."""
-    with connection() as db:
-        rows = db.execute(
-            "SELECT claim_id FROM claims WHERE status = 'waiting' "
-            "ORDER BY claim_id LIMIT ?",
-            (limit,),
-        ).fetchall()
-    return [row["claim_id"] for row in rows]
-
-
-def validate_selection_request(
-    db: CoreConnection, run_id: str, claim_ids: list[str]
-) -> None:
-    """Reject invalid claim selection before making any reservation."""
-    run = db.execute(
-        "SELECT run_type, max_claims, status, selection_complete "
-        "FROM runs WHERE run_id = ?",
-        (run_id,),
-    ).fetchone()
-    if run is None:
-        raise KeyError(run_id)
-    if run["status"] != "in progress":
-        raise ValueError("Run is not active")
-    if run["selection_complete"]:
-        raise ValueError("Claims have already been selected for this run")
-    if len(claim_ids) > run["max_claims"]:
-        raise ValueError("Selected claims exceed the run cap")
-    if len(set(claim_ids)) != len(claim_ids):
-        raise ValueError("A claim can only be selected once")
-    if run["run_type"] == "queue":
-        waiting_count_row = db.execute(
-            "SELECT COUNT(*) FROM claims WHERE status = 'waiting'"
-        ).fetchone()
-        if waiting_count_row is None:
-            raise RuntimeError("Could not count waiting claims")
-        waiting_count = waiting_count_row[0]
-        expected = min(run["max_claims"], waiting_count)
-        if len(claim_ids) != expected:
-            raise ValueError(f"Run must select exactly {expected} waiting claims")
-
-
-def validate_claims_waiting(db: CoreConnection, claim_ids: list[str]) -> None:
-    """Confirm every requested claim is still waiting before reservation."""
-    for claim_id in claim_ids:
-        claim = db.execute(
-            "SELECT status FROM claims WHERE claim_id = ?", (claim_id,)
-        ).fetchone()
-        if claim is None:
-            raise KeyError(claim_id)
-        if claim["status"] != "waiting":
-            raise ValueError(f"Claim {claim_id} is not waiting")
-
-
-def select_run_claims(run_id: str, claim_ids: list[str]) -> None:
-    """Atomically reserve selected waiting claims and create their to-dos."""
-    with connection() as db:
-        db.execute("BEGIN IMMEDIATE")
-        validate_selection_request(db, run_id, claim_ids)
-        validate_claims_waiting(db, claim_ids)
-        for position, claim_id in enumerate(claim_ids):
-            updated = db.execute(
-                "UPDATE claims SET status = 'in progress', run_id = ?, "
-                "thread_id = NULL, "
-                "lease_at = CURRENT_TIMESTAMP "
-                "WHERE claim_id = ? AND status = 'waiting'",
-                (run_id, claim_id),
-            )
-            if updated.rowcount != 1:
-                raise ValueError(f"Claim {claim_id} was acquired by another run")
-            db.execute(
-                "INSERT INTO todos "
-                "(run_id, position, claim_id, description) VALUES (?, ?, ?, ?)",
-                (run_id, position, claim_id, f"Review {claim_id}"),
-            )
-        db.execute(
-            "UPDATE runs SET selection_complete = 1, required_claims = ?, "
-            "heartbeat_at = CURRENT_TIMESTAMP WHERE run_id = ?",
-            (len(claim_ids), run_id),
-        )
-
-
-def plan_run_todos(run_id: str, items: list[dict[str, str]]) -> None:
-    """Persist the queue agent's order and descriptions for selected claims."""
-    with connection() as db:
-        db.execute("BEGIN IMMEDIATE")
-        run = db.execute(
-            "SELECT status FROM runs WHERE run_id = ?", (run_id,)
-        ).fetchone()
-        if run is None:
-            raise KeyError(run_id)
-        if run["status"] != "in progress":
-            raise ValueError("Run is not active")
-        current = db.execute(
-            "SELECT todo_id, position, claim_id, status, attempt_count FROM todos "
-            "WHERE run_id = ? ORDER BY position",
-            (run_id,),
-        ).fetchall()
-        requested_ids = [item["claim_id"] for item in items]
-        if len(set(requested_ids)) != len(requested_ids) or set(requested_ids) != {
-            row["claim_id"] for row in current
-        }:
-            raise ValueError("Run plan must include each selected claim once")
-        offset = len(current)
-        db.execute(
-            "UPDATE todos SET position = position + ? WHERE run_id = ?",
-            (offset, run_id),
-        )
-        for position, item in enumerate(items):
-            db.execute(
-                "UPDATE todos SET position = ?, description = ? "
-                "WHERE run_id = ? AND claim_id = ?",
-                (position, item["description"], run_id, item["claim_id"]),
-            )
-        touch_run(db, run_id)
-
-
 def get_run(run_id: str) -> dict[str, Any] | None:
     """Return one run and its ordered work items."""
     with connection() as db:
         row = db.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         if row is None:
             return None
-        todos = db.execute(
-            "SELECT todo_id, position, claim_id, description, status, attempt_count "
-            "FROM todos "
-            "WHERE run_id = ? ORDER BY position",
-            (run_id,),
-        ).fetchall()
         claims = db.execute(
             "SELECT claim_id, started_at, seconds, model_cost "
             "FROM run_claims WHERE run_id = ? ORDER BY position",
@@ -1432,27 +1264,7 @@ def get_run(run_id: str) -> dict[str, Any] | None:
         "claims": claim_records,
         "model_cost": totals["cost"] if totals else 0.0,
         "seconds": work["seconds"] if work else 0.0,
-        "todos": [dict(todo) for todo in todos],
     }
-
-
-def get_current_run() -> dict[str, Any] | None:
-    """Return the active run and its work items, if one exists."""
-    with connection() as db:
-        row = db.execute(
-            "SELECT run_id FROM runs WHERE status = 'in progress' "
-            "ORDER BY run_order DESC LIMIT 1"
-        ).fetchone()
-    return get_run(row["run_id"]) if row is not None else None
-
-
-def get_latest_run() -> dict[str, Any] | None:
-    """Return the most recently created run and its work items."""
-    with connection() as db:
-        row = db.execute(
-            "SELECT run_id FROM runs ORDER BY run_order DESC LIMIT 1"
-        ).fetchone()
-    return get_run(row["run_id"]) if row is not None else None
 
 
 def create_dispatch(
@@ -1598,7 +1410,6 @@ def record_run_claims(run_id: str, claim_ids: list[str]) -> None:
                 "INSERT INTO run_claims (run_id, claim_id, position) VALUES (?, ?, ?)",
                 (run_id, claim_id, position),
             )
-        touch_run(db, run_id)
 
 
 def finish_run_summary(run_id: str, summary: str) -> Any:
@@ -1799,50 +1610,6 @@ def record_work_time(
             )
 
 
-def set_todo_status(todo_id: int, status: str) -> None:
-    """Update the state of one persisted work item."""
-    with connection() as db:
-        todo = db.execute(
-            "SELECT run_id, claim_id, status FROM todos WHERE todo_id = ?",
-            (todo_id,),
-        ).fetchone()
-        if todo is None:
-            raise KeyError(todo_id)
-        db.execute(
-            "UPDATE todos SET status = ?, attempt_count = attempt_count + ? "
-            "WHERE todo_id = ?",
-            (
-                status,
-                int(status == "in progress" and todo["status"] != "in progress"),
-                todo_id,
-            ),
-        )
-        touch_run(db, todo["run_id"])
-        if status == "in progress":
-            touch_claim_lease(db, todo["claim_id"])
-        elif status == "done":
-            db.execute(
-                "UPDATE claims SET failure_count = 0, lease_at = NULL "
-                "WHERE claim_id = ? AND decision_json IS NOT NULL",
-                (todo["claim_id"],),
-            )
-        elif status == "left for handler":
-            db.execute(
-                "UPDATE claims SET status = 'needs handler', lease_at = NULL "
-                "WHERE claim_id = ?",
-                (todo["claim_id"],),
-            )
-
-
-def set_todo_status_for_claim(run_id: str, claim_id: str, status: str) -> None:
-    """Update the work item for one claim in a run."""
-    with connection() as db:
-        db.execute(
-            "UPDATE todos SET status = ? WHERE run_id = ? AND claim_id = ?",
-            (status, run_id, claim_id),
-        )
-
-
 def finish_run(run_id: str, summary: str) -> None:
     """Store a run summary and mark the run complete."""
     with connection() as db:
@@ -1852,326 +1619,3 @@ def finish_run(run_id: str, summary: str) -> None:
             "WHERE run_id = ? AND status = 'in progress'",
             (summary, run_id),
         )
-
-
-def interrupt_run(run_id: str) -> None:
-    """Mark a run interrupted after its selected claims could not be acquired."""
-    with connection() as db:
-        db.execute(
-            "UPDATE runs SET status = 'interrupted', "
-            "finished_at = CURRENT_TIMESTAMP, "
-            "summary = COALESCE(summary, 'Run interrupted before completion.'), "
-            "heartbeat_at = CURRENT_TIMESTAMP WHERE run_id = ? "
-            "AND status = 'in progress'",
-            (run_id,),
-        )
-
-
-def fail_claim_attempt(run_id: str, claim_id: str, detail: str) -> dict[str, Any]:
-    """Persist one failed attempt and resolve its retry or handler state."""
-    with connection() as db:
-        db.execute("BEGIN IMMEDIATE")
-        todo = db.execute(
-            "SELECT todo_id FROM todos WHERE run_id = ? AND claim_id = ?",
-            (run_id, claim_id),
-        ).fetchone()
-        claim = db.execute(
-            "SELECT decision_json, payment_json, sign_off_handler_id, failure_count "
-            "FROM claims WHERE claim_id = ? "
-            "AND run_id = ?",
-            (claim_id, run_id),
-        ).fetchone()
-        run = db.execute(
-            "SELECT status FROM runs WHERE run_id = ?", (run_id,)
-        ).fetchone()
-        if todo is None or claim is None:
-            raise KeyError(claim_id)
-        if run is None or run["status"] != "in progress":
-            raise ValueError("Run is not active")
-        decision = (
-            json.loads(claim["decision_json"]) if claim["decision_json"] else None
-        )
-        payment = json.loads(claim["payment_json"]) if claim["payment_json"] else None
-        awaiting_signoff = bool(
-            decision
-            and decision["outcome"] == "approve"
-            and decision["needs_sign_off"]
-            and claim["sign_off_handler_id"] is None
-            and payment is None
-        )
-        already_complete = bool(
-            decision
-            and (
-                decision["outcome"] != "approve"
-                or payment is not None
-                or awaiting_signoff
-            )
-        )
-        if already_complete:
-            claim_status = "waiting for sign-off" if awaiting_signoff else "decided"
-            db.execute(
-                "UPDATE claims SET status = ?, failure_count = 0, lease_at = NULL "
-                "WHERE claim_id = ?",
-                (claim_status, claim_id),
-            )
-            db.execute(
-                "UPDATE todos SET status = 'done' WHERE todo_id = ?",
-                (todo["todo_id"],),
-            )
-            touch_run(db, run_id)
-            return {
-                "failure_count": 0,
-                "retry": False,
-                "already_complete": True,
-                "claim_status": claim_status,
-                "todo_status": "done",
-            }
-        failures = int(claim["failure_count"]) + 1
-        retry = failures < MAX_CLAIM_FAILURES
-        if not retry:
-            status = "needs handler"
-            todo_status = "left for handler"
-        elif claim["decision_json"] is None:
-            status = "waiting"
-            todo_status = "to do"
-        else:
-            status = "in progress"
-            todo_status = "to do"
-        db.execute(
-            "UPDATE claims SET failure_count = ?, status = ?, thread_id = CASE "
-            "WHEN ? IN ('waiting', 'needs handler') THEN NULL ELSE thread_id END, "
-            "lease_at = "
-            "CASE WHEN ? = 'in progress' THEN CURRENT_TIMESTAMP ELSE NULL END "
-            "WHERE claim_id = ?",
-            (failures, status, status, status, claim_id),
-        )
-        db.execute(
-            "UPDATE todos SET status = ? WHERE todo_id = ?",
-            (todo_status, todo["todo_id"]),
-        )
-        db.execute(
-            "INSERT INTO steps (claim_id, step, detail) VALUES (?, ?, ?)",
-            (claim_id, "Attempt failed", f"Attempt {failures}: {detail}"),
-        )
-        touch_run(db, run_id)
-        return {
-            "failure_count": failures,
-            "retry": retry,
-            "claim_status": status,
-            "todo_status": todo_status,
-        }
-
-
-def retry_claim_attempt(run_id: str, claim_id: str) -> int:
-    """Reacquire one claim for a retry in its existing run."""
-    with connection() as db:
-        db.execute("BEGIN IMMEDIATE")
-        run = db.execute(
-            "SELECT status FROM runs WHERE run_id = ?", (run_id,)
-        ).fetchone()
-        todo = db.execute(
-            "SELECT todo_id, status, attempt_count FROM todos "
-            "WHERE run_id = ? AND claim_id = ?",
-            (run_id, claim_id),
-        ).fetchone()
-        claim = db.execute(
-            "SELECT status, failure_count, decision_json "
-            "FROM claims WHERE claim_id = ? "
-            "AND run_id = ?",
-            (claim_id, run_id),
-        ).fetchone()
-        if run is None or todo is None or claim is None:
-            raise KeyError(claim_id)
-        if run["status"] != "in progress":
-            raise ValueError("Run is not active")
-        if claim["failure_count"] >= MAX_CLAIM_FAILURES:
-            raise ValueError("Claim already needs handler attention")
-        if todo["status"] != "to do":
-            raise ValueError("Claim is not ready for retry")
-        if claim["status"] == "waiting":
-            updated = db.execute(
-                "UPDATE claims SET status = 'in progress', thread_id = NULL, "
-                "lease_at = "
-                "CURRENT_TIMESTAMP WHERE claim_id = ? AND status = 'waiting' "
-                "AND run_id = ?",
-                (claim_id, run_id),
-            )
-            if updated.rowcount != 1:
-                raise ValueError("Claim could not be reacquired for retry")
-        elif claim["status"] != "in progress" or claim["decision_json"] is None:
-            raise ValueError("Claim state is not retryable")
-        db.execute(
-            "UPDATE todos SET status = 'in progress', "
-            "attempt_count = attempt_count + 1 WHERE todo_id = ?",
-            (todo["todo_id"],),
-        )
-        db.execute(
-            "INSERT INTO steps (claim_id, step, detail) VALUES (?, ?, ?)",
-            (claim_id, "Attempt started", f"Attempt {int(todo['attempt_count']) + 1}."),
-        )
-        touch_run(db, run_id)
-        return int(todo["attempt_count"]) + 1
-
-
-def expired_run_ids(lease_seconds: int) -> list[str]:
-    """List active runs whose heartbeat lease has expired."""
-    with connection() as db:
-        rows = db.execute(
-            "SELECT run_id, heartbeat_at, created_at FROM runs "
-            "WHERE status = 'in progress' ORDER BY created_at"
-        ).fetchall()
-    return [
-        row["run_id"]
-        for row in rows
-        if lease_has_expired(row["heartbeat_at"], row["created_at"], lease_seconds)
-    ]
-
-
-def recover_expired_todo(db: CoreConnection, run_id: str, todo: RowView) -> bool:
-    """Resolve persisted claim state and report whether it needs continuation."""
-    decision = json.loads(todo["decision_json"]) if todo["decision_json"] else None
-    payment = json.loads(todo["payment_json"]) if todo["payment_json"] else None
-    needs_handler_signoff = bool(
-        decision
-        and decision["outcome"] == "approve"
-        and decision["needs_sign_off"]
-        and todo["sign_off_handler_id"] is None
-        and payment is None
-    )
-    already_complete = bool(
-        decision
-        and (
-            decision["outcome"] != "approve"
-            or payment is not None
-            or needs_handler_signoff
-        )
-    )
-    if already_complete:
-        status = "waiting for sign-off" if needs_handler_signoff else "decided"
-        db.execute(
-            "UPDATE claims SET status = ?, failure_count = 0, lease_at = NULL "
-            "WHERE claim_id = ?",
-            (status, todo["claim_id"]),
-        )
-        db.execute(
-            "UPDATE todos SET status = 'done' WHERE todo_id = ?",
-            (todo["todo_id"],),
-        )
-        return False
-
-    waiting_for_retry = todo["claim_status"] == "waiting" and todo["status"] == "to do"
-    needs_payment_resume = bool(
-        decision
-        and decision["outcome"] == "approve"
-        and payment is None
-        and not needs_handler_signoff
-    )
-    stuck = todo["claim_status"] == "in progress" or needs_payment_resume
-    if not waiting_for_retry and not stuck:
-        if todo["claim_status"] == "needs handler":
-            db.execute(
-                "UPDATE todos SET status = 'left for handler' WHERE todo_id = ?",
-                (todo["todo_id"],),
-            )
-        return False
-
-    failures = int(todo["failure_count"])
-    if stuck:
-        db.execute(
-            "INSERT INTO steps (claim_id, step, detail) "
-            "VALUES (?, 'Attempt interrupted', ?)",
-            (todo["claim_id"], f"Run {run_id} lease expired."),
-        )
-    if failures >= MAX_CLAIM_FAILURES:
-        db.execute(
-            "UPDATE claims SET failure_count = ?, status = 'needs handler', "
-            "lease_at = NULL WHERE claim_id = ?",
-            (failures, todo["claim_id"]),
-        )
-        db.execute(
-            "UPDATE todos SET status = 'left for handler' WHERE todo_id = ?",
-            (todo["todo_id"],),
-        )
-        return False
-
-    db.execute(
-        "UPDATE claims SET failure_count = ?, status = 'waiting', lease_at = NULL "
-        "WHERE claim_id = ?",
-        (failures, todo["claim_id"]),
-    )
-    db.execute(
-        "UPDATE todos SET status = 'to do' WHERE todo_id = ?",
-        (todo["todo_id"],),
-    )
-    return True
-
-
-def recover_expired_run(
-    run_id: str, lease_seconds: int, force: bool = False
-) -> str | None:
-    """Interrupt an expired run and create a continuation for recoverable claims."""
-    with connection() as db:
-        db.execute("BEGIN IMMEDIATE")
-        run = db.execute(
-            "SELECT * FROM runs WHERE run_id = ? AND status = 'in progress'",
-            (run_id,),
-        ).fetchone()
-        if run is None or (
-            not force
-            and not lease_has_expired(
-                run["heartbeat_at"], run["created_at"], lease_seconds
-            )
-        ):
-            return None
-        todos = db.execute(
-            "SELECT t.todo_id, t.position, t.claim_id, t.description, t.status, "
-            "t.attempt_count, "
-            "c.status AS claim_status, c.failure_count, c.decision_json, "
-            "c.payment_json, c.sign_off_handler_id, c.lease_at "
-            "FROM todos AS t JOIN claims AS c USING (claim_id) "
-            "WHERE t.run_id = ? ORDER BY t.position",
-            (run_id,),
-        ).fetchall()
-        resumes = [todo for todo in todos if recover_expired_todo(db, run_id, todo)]
-
-        continuation_id = str(uuid4()) if resumes else None
-        summary = "Run interrupted after its heartbeat lease expired."
-        if continuation_id:
-            summary += f" Recoverable claims moved to run {continuation_id}."
-        db.execute(
-            "UPDATE runs SET status = 'interrupted', summary = ?, "
-            "finished_at = CURRENT_TIMESTAMP WHERE run_id = ?",
-            (summary, run_id),
-        )
-        if continuation_id is not None:
-            db.execute(
-                "INSERT INTO runs (run_id, run_type, max_claims, status, summary, "
-                "selection_complete, required_claims, heartbeat_at) "
-                "VALUES (?, 'recovery', ?, 'in progress', ?, 1, ?, CURRENT_TIMESTAMP)",
-                (
-                    continuation_id,
-                    len(resumes),
-                    f"Resuming interrupted run {run_id}.",
-                    len(resumes),
-                ),
-            )
-            for position, todo in enumerate(resumes):
-                db.execute(
-                    "UPDATE claims SET status = 'in progress', run_id = ?, "
-                    "lease_at = CURRENT_TIMESTAMP WHERE claim_id = ?",
-                    (continuation_id, todo["claim_id"]),
-                )
-                db.execute(
-                    "INSERT INTO todos "
-                    "(run_id, position, claim_id, description, status, attempt_count) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        continuation_id,
-                        position,
-                        todo["claim_id"],
-                        todo["description"],
-                        todo["status"],
-                        todo["attempt_count"],
-                    ),
-                )
-        return continuation_id

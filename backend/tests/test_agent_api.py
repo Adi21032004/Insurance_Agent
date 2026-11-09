@@ -14,7 +14,8 @@ def test_start_claim_marks_in_progress_before_background_work(
     assert response.status_code == 200
     assert response.json()["status"] == "in progress"
     assert started == ["CLM-1001"]
-    assert database.get_latest_run() is None
+    with database.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
     claim = client.get("/api/claims/CLM-1001").json()
     assert claim["status"] == "in progress"
     assert claim["decision"] is None

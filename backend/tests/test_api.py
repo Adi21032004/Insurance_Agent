@@ -2,7 +2,7 @@ import json
 
 from fastapi.testclient import TestClient
 
-from agent.instructions import CLAIM_INSTRUCTIONS, QUEUE_INSTRUCTIONS
+from agent.instructions import CLAIM_INSTRUCTIONS
 from backend import database
 from backend.main import app
 
@@ -79,16 +79,13 @@ def test_company_exchange_rate_drives_queue_context_and_payout(monkeypatch, tmp_
     assert payout["payout_inr"] == 42000.0
 
 
-def test_instructions_return_distinct_queue_and_claim_prompts(monkeypatch, tmp_path):
+def test_instructions_return_claim_prompt(monkeypatch, tmp_path):
     monkeypatch.setattr(database, "DATABASE_PATH", tmp_path / "claims.sqlite3")
     with TestClient(app) as client:
         response = client.get("/api/instructions")
 
     assert response.status_code == 200
-    assert response.json() == {
-        "queue_instructions": QUEUE_INSTRUCTIONS,
-        "claim_instructions": CLAIM_INSTRUCTIONS,
-    }
+    assert response.json() == {"claim": CLAIM_INSTRUCTIONS}
 
 
 def test_agent_claim_context_does_not_include_full_source_documents(client):

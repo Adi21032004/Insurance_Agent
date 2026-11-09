@@ -1,6 +1,6 @@
 type InstructionsPageProps = Readonly<{
   instructions: {
-    claim_instructions: string;
+    claim: string;
   } | null;
 }>;
 
@@ -15,9 +15,7 @@ export function InstructionsPage({ instructions }: InstructionsPageProps) {
       ) : (
         <section>
           <h3>Claim agent</h3>
-          <pre className="instruction-copy">
-            {instructions.claim_instructions}
-          </pre>
+          <pre className="instruction-copy">{instructions.claim}</pre>
         </section>
       )}
     </section>

@@ -39,7 +39,6 @@ export default defineConfig({
         UNDERCOVER_AGENT: `http://127.0.0.1:${standInPort}`,
         UNDERCOVER_AGENT_TEST_MODE: "1",
         UNDERCOVER_TEST_FAILURE_PLAN: "CLM-1006:always,CLM-1007:once",
-        UNDERCOVER_TEST_MISSED_CLAIM: "CLM-1002",
         UNDERCOVER_BACKEND_URL: `http://127.0.0.1:${backendPort}`,
       },
     },
@@ -57,7 +56,6 @@ export default defineConfig({
         UNDERCOVER_AGENT_TEST_MODE: "1",
         UNDERCOVER_BACKEND_URL: `http://127.0.0.1:${backendPort}`,
         UNDERCOVER_TEST_FAILURE_PLAN: "CLM-1006:always,CLM-1007:once",
-        UNDERCOVER_TEST_MISSED_CLAIM: "CLM-1002",
       },
     },
     {

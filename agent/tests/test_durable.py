@@ -15,8 +15,6 @@ from agent.harness import (
     carry_on,
     checkpoint_pool,
     claim_graphs,
-    process_saved_run,
-    run_queue,
     work_claim,
 )
 from agent.testing import StubModel, durable_stub_model, tool_message
@@ -36,7 +34,6 @@ def backend_client(
     monkeypatch.setenv("UNDERCOVER_AGENT_TEST_MODE", "1")
     monkeypatch.setattr(database, "DATABASE_PATH", tmp_path / "durable.sqlite3")
     monkeypatch.setattr(agent_service, "resume_claim", lambda claim_id: None)
-    monkeypatch.setattr(agent_service, "run_queue", lambda run_id: None)
     monkeypatch.setattr(api, "backend", lambda: TestClient(app))
     with TestClient(app) as client:
         yield client
@@ -294,58 +291,6 @@ def test_claim_restart_continues_from_saved_tool_results(backend_client: TestCli
     assert completed["payment"]["amount_inr"] == 34860.0
 
 
-def test_expired_run_resumes_claim_on_the_same_thread_and_attempt(
-    backend_client: TestClient,
-):
-    run_id = "durable-recovery-run"
-    database.create_run(run_id, "queue", 1)
-    database.select_run_claims(run_id, ["CLM-1001"])
-    created_run = database.get_run(run_id)
-    assert created_run is not None
-    todo = created_run["todos"][0]
-    database.set_todo_status(todo["todo_id"], "in progress")
-    saver = InMemorySaver()
-    interrupted_model = StubModel(
-        messages=iter(
-            [
-                tool_message("get_claim", {}, "before-recovery-1"),
-                tool_message("get_policy", {}, "before-recovery-2"),
-            ]
-        )
-    )
-    first_graph = build_claim_graph(interrupted_model, saver)
-
-    with pytest.raises(RuntimeError, match="generator raised StopIteration"):
-        work_claim("CLM-1001", first_graph)
-    stopped = backend_client.get("/api/claims/CLM-1001").json()
-    thread_id = stopped["thread_id"]
-    with database.connection() as db:
-        db.execute(
-            "UPDATE runs SET heartbeat_at = '2000-01-01 00:00:00' WHERE run_id = ?",
-            (run_id,),
-        )
-
-    recovery_id = database.recover_expired_run(run_id, 300)
-    assert recovery_id is not None
-    recovered_run = database.get_run(recovery_id)
-    assert recovered_run is not None
-    assert recovered_run["todos"][0]["status"] == "in progress"
-    assert recovered_run["todos"][0]["attempt_count"] == 1
-
-    resumed_graph = build_claim_graph(durable_stub_model("CLM-1001"), saver)
-    process_saved_run(recovery_id, saver, graph=resumed_graph)
-    completed = backend_client.get("/api/claims/CLM-1001").json()
-    completed_run = database.get_run(recovery_id)
-
-    assert completed["thread_id"] == thread_id
-    assert completed["failure_count"] == 0
-    assert completed["status"] == "decided"
-    assert completed["payment"]["amount_inr"] == 34860.0
-    assert completed_run is not None
-    assert completed_run["todos"][0]["status"] == "done"
-    assert completed_run["todos"][0]["attempt_count"] == 1
-
-
 def test_payment_saved_before_restart_is_replayed_idempotently(
     backend_client: TestClient, monkeypatch: pytest.MonkeyPatch
 ):
@@ -379,13 +324,12 @@ def test_payment_saved_before_restart_is_replayed_idempotently(
     assert payment_row[0] == 1
 
 
-def test_agent_api_operations_cover_claim_knowledge_payout_and_runs(
+def test_agent_api_operations_cover_claim_knowledge_and_payout(
     backend_client: TestClient,
 ):
     claim = api.get_claim("CLM-1001")
     assert api.get_policy("CLM-1001") == claim["policy"]
     assert api.get_claim_history("CLM-1001") == claim["customer"]["previous_claims"]
-    assert api.get_latest_run() is None
 
     database.set_claim_status("CLM-1001", "in progress")
     results = api.search_documents("CLM-1001", "policy_wording", "trip delay")
@@ -409,7 +353,7 @@ def test_agent_api_operations_cover_claim_knowledge_payout_and_runs(
     )
     assert payout["payout"] == 245.0
     assert section["section_id"] == results[0]["section_id"]
-    assert api.get_instructions()["claim_instructions"]
+    assert api.get_instructions()["claim"]
     api.record_decision(
         "CLM-1001",
         {
@@ -436,39 +380,7 @@ def test_agent_api_operations_cover_claim_knowledge_payout_and_runs(
     )
     assert api.pay_claim("CLM-1002", 0)["status"] == "decided"
     assert api.get_agent_claim("CLM-1002")["payment"]["amount_inr"] == 0
-    assert api.get_queue_claims()
-
-    run_id = api.create_direct_run(1)
-    api.select_run_claims(run_id, ["CLM-1003"])
-    api.plan_run_todos(
-        run_id, [{"claim_id": "CLM-1003", "description": "Review the claim"}]
-    )
-    todo_id = api.get_run(run_id)["todos"][0]["todo_id"]
-    api.update_run_todo(run_id, todo_id, "in progress")
-    assert api.fail_run_attempt(run_id, "CLM-1003", "Temporary outage")["retry"]
-    assert api.retry_run_claim(run_id, "CLM-1003", "Retry the review") == 2
-    api.save_claim_thread("CLM-1003", "claim-thread-1003")
-    api.record_decision(
-        "CLM-1003",
-        {
-            "outcome": "refer",
-            "reason": "A handler should review the evidence.",
-            "policy_section": "Section 7: Emergency Medical",
-            "benefit": "emergency_medical",
-            "lines": [],
-            "paid_by_others": 0,
-        },
-    )
-    api.update_run_todo(run_id, todo_id, "done")
-    api.complete_run(run_id, "Reviewed one claim.")
-    assert api.get_run(run_id)["status"] == "completed"
-    latest_run = api.get_latest_run()
-    assert latest_run is not None
-    assert latest_run["run_id"] == run_id
-
-    named_run_id = api.create_direct_claim_run("CLM-1004")
-    api.interrupt_run(named_run_id)
-    assert api.get_run(named_run_id)["status"] == "interrupted"
+    assert api.get_dispatch_claims()
 
 
 def test_checkpoint_pool_uses_memory_without_a_database_url(
@@ -530,22 +442,3 @@ def test_checkpoint_pool_shares_connections_but_builds_a_saver_per_claim(
         assert first.pool is pool
         assert second.pool is pool
     assert pool.closed
-
-
-def test_run_queue_carries_saved_work_before_an_empty_queue(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-):
-    monkeypatch.setattr(api, "get_latest_run", lambda: None)
-    monkeypatch.setattr(
-        api,
-        "get_queue_claims",
-        lambda: [{"claim_id": "CLM-1001", "status": "in progress"}],
-    )
-    monkeypatch.setattr("agent.harness.model", lambda claim_id: object())
-    monkeypatch.setattr("agent.harness.build_claim_graph", lambda llm, saver: object())
-    monkeypatch.setattr(
-        "agent.harness.carry_on", lambda claim_id, graph: "recovered claim"
-    )
-
-    assert run_queue(1) == "No claims are waiting"
-    assert capsys.readouterr().out.strip() == "recovered claim"

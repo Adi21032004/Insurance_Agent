@@ -274,7 +274,7 @@ export function jsonResponse(body: unknown, status = 200): Response {
 export function mockApi(initialDetail: ClaimDetail = makeDetail()) {
   let currentDetail = initialDetail;
   const instructions = {
-    claim_instructions: "Use the policy wording and claims manual.",
+    claim: "Use the policy wording and claims manual.",
   };
   let savedDispatch: DispatchRun | null = null;
   const getRoutes: Partial<Record<string, (init?: RequestInit) => Response>> = {

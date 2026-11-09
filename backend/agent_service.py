@@ -26,14 +26,6 @@ def post_agent(path: str, json_body: dict[str, Any] | None = None) -> httpx.Resp
         return response
 
 
-def run_queue(run_id: str) -> None:
-    """Ask the agent service to process one saved queue run."""
-    try:
-        post_agent(f"/api/runs/{run_id}/run")
-    except httpx.HTTPError as error:
-        logger.warning("Could not start agent run %s: %s", run_id, error)
-
-
 def resume_claim(claim_id: str) -> None:
     """Ask the agent service to carry on a signed-off claim."""
     try:

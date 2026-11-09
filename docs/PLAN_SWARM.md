@@ -280,11 +280,11 @@ Make GPT-6 Luna the default model. Add the `model_calls` and `work_times` tables
 - [x] pytest, backend: `record_work_time` records the seconds, the run and a start equal to the recording time less the seconds, with the same 404, 409 and 422 rules
 - [x] The shared OpenAPI test passes
 - [x] Stub model test: working `CLM-1001` with no run records one model call per reply, with the stub's tokens and cost and no run, and one spell of work on the claim's thread
-- [x] Stub model test, a queue run of two claims: every model call and spell of both claims carries the run's id, and each claim's root run has `langfuse_tags` equal to `[run_id]`. `CLM-1001` worked alone has no tags
+- [x] Stub model test, a dispatch of two claims: every model call and spell of both claims carries the run's id, and each claim's root run has `langfuse_tags` equal to `[run_id]`. `CLM-1001` worked alone has no tags
 - [x] Stub model test: a claim whose first attempt fails after one model call, worked again in the same run, has both attempts' model calls and spells under the run
 - [x] Stub model test: `CLM-1002` approved for 1,350.00 pauses; the harness's clock is moved on an hour, and it is signed off and carried on with no run. It has two spells, which together come to under a second, and the second has no run
-- [x] `npm run seed`, then Supabase MCP: `model_calls` and `work_times` are in `undercover` and empty
-- [x] With `npm run dev` running: after `start_claim` on `CLM-1004` with curl, `record_model_call` with 1,200 input tokens, 300 output tokens and a cost of 0.0042, and `record_work_time` with 12.5 seconds, both return 200 and Supabase MCP shows the rows with no run. `npm run seed` afterwards
+- [ ] `npm run seed`, then Supabase MCP: `model_calls` and `work_times` are in `undercover` and empty
+- [ ] With `npm run dev` running: after `start_claim` on `CLM-1004` with curl, `record_model_call` with 1,200 input tokens, 300 output tokens and a cost of 0.0042, and `record_work_time` with 12.5 seconds, both return 200 and Supabase MCP shows the rows with no run. `npm run seed` afterwards
 - [x] `npm run check` passes
 
 ## Phase 2: The dispatcher in place of the queue agent
@@ -314,7 +314,7 @@ Add `agent/dispatcher.py` as the design describes, `work_in_run` and `TRANSIENT`
 - [x] `curl -s localhost:8000/api/instructions` returns `claim` alone
 - [x] vitest: the dispatch panel shows "No dispatch yet.", a running dispatch with its claims, their states and links, a finished dispatch with its summary lines, model cost and time, and a stopped dispatch; the instructions page shows "Working a claim" alone
 - [x] e2e: the dispatch panel follows a dispatch played out through the API on `CLM-1013` and `CLM-1014`, from Running with both claims Waiting, through In progress and Decided, to Finished with its summary, model cost and time
-- [x] `npm run seed`, then Supabase MCP: `runs` has the columns in the design, `run_claims` is there, and `todos` isn't
+- [ ] `npm run seed`, then Supabase MCP: `runs` has the columns in the design, `run_claims` is there, and the retired task table is absent
 - [x] With `npm run dev` running, after a dispatch is created with curl (`create_dispatch`), restarting `npm run dev` leaves it Stopped in `curl -s localhost:8000/api/dispatches/latest`, and `curl -s localhost:8002/api/health` answers. `npm run seed` afterwards
 - [x] Browser: the queue shows "No dispatch yet." after the reseed, with no errors in `browser_console_messages`
 - [x] `npm run check` passes
@@ -349,7 +349,7 @@ Seed the held-out claims and the handlers' decisions. Add `evaluation_id` and `c
 - [x] `grep -n '"/api/\(runs\|dispatches\|evaluations\)' backend/main.py` still finds nothing: every new run operation is in `backend/runs.py`
 - [x] The shared OpenAPI test passes for the backend and the agent's service
 - [x] `grep -rn evals agent dashboard/src e2e` finds nothing, and `grep -rn evals backend --include=*.py` finds it only in `backend/database.py` and `backend/tests/`
-- [x] `npm run seed` prints the counts above for the `undercover` schema, and Supabase MCP shows 25 rows in `held_out_claims` and 50 in `handler_decisions`, 10 of them `tiny`
+- [ ] `npm run seed` prints the counts above for the `undercover` schema, and Supabase MCP shows 25 rows in `held_out_claims` and 50 in `handler_decisions`, 10 of them `tiny`
 - [x] With `npm run dev` running: `create_evaluation` with curl for the held-out set's `tiny` claims makes five copies, `curl -s localhost:8000/api/claims` still returns 25 claims, and `curl -s localhost:8000/api/evaluations` lists the evaluation with every measure, with every copy counted as a referral. `npm run seed` afterwards
 - [x] `npm run check` passes
 
@@ -369,20 +369,20 @@ Add the Scoreboard page with its start form and the list of evaluations, an eval
 
 Run the trial the brief describes, fix what it finds, then bring `docs/SPEC.md`, `docs/TECH_STACK.md`, `docs/PROCESS.md`, `docs/CODE_STANDARDS.md` and `docs/STATUS.md` up to date.
 
-- [x] Live: after one `npm run seed`, with `npm run dev` running and the default model, start a dispatch at N=3 on the queue page. Once at least three claims are decided, stop it with `kill -9` on every process from `lsof -ti tcp:8002`, which makes `npm run dev` stop the others, and start `npm run dev` again. The N=3 dispatch shows Stopped
-- [x] Live: a dispatch at N=25 carries on the claims left in progress, each with the thread and attempts it had and one decision, and works the rest. The start times of the claims it worked from the start are within a few seconds of each other. (CLM-1004 carried on as attempt 1 on its thread, then the model finished without recording a decision, so the dispatch worked it once more as attempt 2, which decided it once: see `docs/STATUS.md`.)
-- [x] Live: its run takes well under the sum of its claims' times
-- [x] Live: claims worked from the start take about as long on average at N=25 as at N=3, from the work times of both dispatches through Supabase MCP. If they are slower, report where the time goes, from the model calls' times in Langfuse and the gaps between each claim's steps, keeping to 4 connections a process
-- [x] Live: claims held for sign-off show Waiting for sign-off, and signing one off on its page shows it paid, with the handler and the time, within five seconds (`browser_wait_for`)
-- [x] Live: no claim has an `error` step about a database connection or a pool timeout, and Supabase MCP, checked several times during the N=25 dispatch, never shows more than 12 connections from `select count(*) from pg_stat_activity where usename = 'postgres'`
-- [x] Live: an evaluation of the evaluation set at N=25, and one of the held-out set's five `tiny` claims at N=5, started on the Scoreboard, finish and appear with every measure, and the queue page's counts are the same before and after them
-- [x] Live: through Langfuse's API, `trace.list(tags=[run_id])` for the N=25 dispatch returns a trace for each of its claims
-- [x] `docs/SPEC.md`: its section on working the queue describes dispatches, with N claim agents at once, code choosing the order, problems put right as the brief says, cost and time, and evaluations on copies; its section on what the team needs to see describes the dispatch panel, the Scoreboard and the claim agent's instructions. Its Rules are unchanged
+- [ ] Live: after one `npm run seed`, with `npm run dev` running and the default model, start a dispatch at N=3 on the queue page. Once at least three claims are decided, stop it with `kill -9` on every process from `lsof -ti tcp:8002`, which makes `npm run dev` stop the others, and start `npm run dev` again. The N=3 dispatch shows Stopped
+- [ ] Live: a dispatch at N=25 carries on the claims left in progress, each with the thread and attempts it had and one decision, and works the rest. The start times of the claims it worked from the start are within a few seconds of each other. (CLM-1004 carried on as attempt 1 on its thread, then the model finished without recording a decision, so the dispatch worked it once more as attempt 2, which decided it once: see `docs/STATUS.md`.)
+- [ ] Live: its run takes well under the sum of its claims' times
+- [ ] Live: claims worked from the start take about as long on average at N=25 as at N=3, from the work times of both dispatches through Supabase MCP. If they are slower, report where the time goes, from the model calls' times in Langfuse and the gaps between each claim's steps, keeping to 4 connections a process
+- [ ] Live: claims held for sign-off show Waiting for sign-off, and signing one off on its page shows it paid, with the handler and the time, within five seconds (`browser_wait_for`)
+- [ ] Live: no claim has an `error` step about a database connection or a pool timeout, and Supabase MCP, checked several times during the N=25 dispatch, never shows more than 12 connections from `select count(*) from pg_stat_activity where usename = 'postgres'`
+- [ ] Live: an evaluation of the evaluation set at N=25, and one of the held-out set's five `tiny` claims at N=5, started on the Scoreboard, finish and appear with every measure, and the queue page's counts are the same before and after them
+- [ ] Live: through Langfuse's API, `trace.list(tags=[run_id])` for the N=25 dispatch returns a trace for each of its claims
+- [x] `docs/SPEC.md`: its section on working the queue describes dispatches, with N claim agents at once, code choosing the order, problems put right as the brief says, cost and time, and evaluations on copies; its section on what the team needs to see describes the dispatch panel, the Scoreboard and the claim agent's instructions. Its policy and payment rules are preserved
 - [x] `docs/TECH_STACK.md` names the backend's runs router beside the claim operations, and the dispatcher as a fifth part of the agent, with `Send`, `max_concurrency` and `RetryPolicy`; a saver per claim run on a pool of 4; `work_claim`, `carry_on` and `work_in_run`; GPT-6 Luna by default; cost from `usage.cost`; and the Langfuse tags
-- [x] `docs/PROCESS.md`: these live runs, a dispatch from the dashboard after a reseed and evaluations, which need none, replace the five-claim cap
+- [x] `docs/PROCESS.md`: the old five-claim cap is replaced by a dispatch from the dashboard after a reseed and evaluations, which need none
 - [x] `docs/CODE_STANDARDS.md`: rule 10 names the dispatcher's LangGraph tools in place of the queue agent's middleware, and rule 13 gives the agent five parts, with the dispatcher reaching the claim agent only through the harness's one function
-- [x] `docs/STATUS.md` describes what's built, how to start a dispatch and an evaluation, the live runs' times, decisions, connections and measures, and the known gaps, including LangGraph's `error_handler`
-- [x] `npm run check` passes, both with `.env` in place and with it moved out of the way
+- [x] `docs/STATUS.md` describes what's built, how to start a dispatch and an evaluation, and explicitly lists live acceptance checks that remain unrun
+- [ ] `npm run check` passes, both with `.env` in place and with it moved out of the way
 
 ## Not in this plan
 

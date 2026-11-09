@@ -12,11 +12,9 @@ from typing import Annotated, Any, TypedDict
 from uuid import uuid4
 
 import psycopg
-from langchain.agents import create_agent
 from langchain_core.exceptions import ModelRateLimitError, ModelTimeoutError
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
-from langchain_core.tools import tool
 from langfuse.langchain import CallbackHandler
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.postgres import PostgresSaver
@@ -30,9 +28,8 @@ from psycopg_pool import ConnectionPool
 from pydantic import SecretStr
 
 from agent import api
-from agent.testing import durable_stub_model, scheduled_stub_miss, stub_queue_model
+from agent.testing import durable_stub_model
 from agent.tools import CLAIM_TOOLS, ClaimContext
-from backend.schemas import RunTodoItemInput
 
 logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "openai/gpt-6-luna"
@@ -196,7 +193,7 @@ def build_claim_graph(
     llm: BaseChatModel, saver: Any, claim_instructions: str | None = None
 ) -> Any:
     """Build the claim agent as a persisted LangGraph workflow."""
-    instructions = claim_instructions or api.get_instructions()["claim_instructions"]
+    instructions = claim_instructions or api.get_instructions()["claim"]
     model_with_tools = llm.bind_tools(CLAIM_TOOLS)
     tool_node = ToolNode(CLAIM_TOOLS, handle_tool_errors=True)
 
@@ -419,228 +416,6 @@ def work_in_run(claim_id: str, run_id: str, new_graph: Callable[[], Any]) -> str
             raise RuntimeError("The evaluation claim checkpoint cannot be cleared")
         saver.delete_thread(thread_id)
     return report
-
-
-@tool
-def save_run_plan(run_id: str, items: list[RunTodoItemInput]) -> str:
-    """Reserve claims and persist their ordered queue to-do list."""
-    item_dicts = [item.model_dump() for item in items]
-    api.select_run_claims(run_id, [item["claim_id"] for item in item_dicts])
-    api.plan_run_todos(run_id, item_dicts)
-    return json.dumps({"status": "saved", "items": item_dicts})
-
-
-def _queue_model(
-    candidate_ids: list[str], max_claims: int, run_id: str
-) -> BaseChatModel:
-    """Create the queue planner model."""
-    if os.getenv("UNDERCOVER_AGENT_TEST_MODE") == "1":
-        return stub_queue_model(candidate_ids, max_claims, run_id)
-    return model()
-
-
-def _plan_run(
-    run_id: str,
-    run: dict[str, Any],
-    waiting: list[dict[str, Any]],
-    llm: BaseChatModel | None = None,
-) -> None:
-    """Ask the queue agent for its ordered capped selection."""
-    if run["run_type"] != "queue" or run["selection_complete"]:
-        return
-    planner = create_agent(
-        llm
-        or _queue_model(
-            [claim["claim_id"] for claim in waiting], run["max_claims"], run_id
-        ),
-        tools=[save_run_plan],
-        system_prompt=api.get_instructions()["queue_instructions"],
-    )
-    planner.invoke(
-        {
-            "messages": [
-                HumanMessage(
-                    content=json.dumps(
-                        {
-                            "run_id": run_id,
-                            "max_claims": run["max_claims"],
-                            "waiting_claims": waiting,
-                            "required_count": min(run["max_claims"], len(waiting)),
-                        }
-                    )
-                )
-            ]
-        }
-    )
-
-
-def _completed_outcome(record: dict[str, Any]) -> str | None:
-    """Return a terminal outcome when the required payment work is complete."""
-    decision = record["decision"]
-    if decision is None:
-        return None
-    if decision["outcome"] != "approve" or record["payment"] is not None:
-        return decision["outcome"]
-    if decision["needs_sign_off"] and record["sign_off_handler_id"] is None:
-        return decision["outcome"]
-    return None
-
-
-def _finish_todo_if_complete(
-    run_id: str, todo: dict[str, Any], record: dict[str, Any]
-) -> tuple[str | None, bool] | None:
-    """Update a selected task already complete before its next attempt."""
-    if record["status"] == "needs handler":
-        if todo["status"] != "left for handler":
-            api.update_run_todo(run_id, todo["todo_id"], "left for handler")
-        return None, True
-    outcome = _completed_outcome(record)
-    if outcome is None:
-        return None
-    if todo["status"] != "done":
-        api.update_run_todo(run_id, todo["todo_id"], "done")
-    return outcome, False
-
-
-def _begin_todo_attempt(
-    run_id: str, todo: dict[str, Any], record: dict[str, Any]
-) -> int:
-    """Reserve a selected task or count its next attempt."""
-    if todo["status"] == "in progress":
-        return int(todo["attempt_count"])
-    if record["status"] == "waiting":
-        return api.retry_run_claim(
-            run_id, todo["claim_id"], "Reacquiring a selected claim during recovery."
-        )
-    api.update_run_todo(run_id, todo["todo_id"], "in progress")
-    return int(todo["attempt_count"]) + 1
-
-
-def _process_todo(
-    run_id: str, todo: dict[str, Any], saver: Any, graph: Any | None = None
-) -> tuple[str | None, bool]:
-    """Run or resume one selected claim, retrying its first failure once."""
-    claim_id = todo["claim_id"]
-    record = api.get_agent_claim(claim_id)
-    completed = _finish_todo_if_complete(run_id, todo, record)
-    if completed is not None:
-        return completed
-    attempt = _begin_todo_attempt(run_id, todo, record)
-    while True:
-        try:
-            current = api.get_agent_claim(claim_id)
-            thread_id = _thread_id(claim_id, current)
-            claim_graph = graph or build_claim_graph(model(claim_id), saver)
-            report = (
-                carry_on(claim_id, claim_graph)
-                if current["decision"] is not None
-                else work_claim(claim_id, claim_graph, thread_id)
-            )
-            current = api.get_agent_claim(claim_id)
-            outcome = _completed_outcome(current)
-            if outcome is None:
-                raise RuntimeError(report)
-            api.update_run_todo(run_id, todo["todo_id"], "done")
-            return outcome, False
-        except Exception as error:
-            failure = api.fail_run_attempt(
-                run_id, claim_id, f"{type(error).__name__}: {error}"[:500]
-            )
-            if failure.get("already_complete"):
-                return api.get_agent_claim(claim_id)["decision"]["outcome"], False
-            if not failure["retry"]:
-                return None, True
-            attempt = api.retry_run_claim(
-                run_id,
-                claim_id,
-                f"Retrying after persisted failure {failure['failure_count']}.",
-            )
-            record = api.get_agent_claim(claim_id)
-            logger.info("Retrying %s at attempt %s", claim_id, attempt)
-
-
-def process_saved_run(
-    run_id: str,
-    saver: Any,
-    graph: Any | None = None,
-    llm: BaseChatModel | None = None,
-) -> str:
-    """Plan and process one queue or named-claim run already stored by backend."""
-    run = api.get_run(run_id)
-    waiting = [
-        claim for claim in api.get_queue_claims() if claim["status"] == "waiting"
-    ]
-    _plan_run(run_id, run, waiting, llm)
-    run = api.get_run(run_id)
-    if not run["selection_complete"]:
-        raise RuntimeError("The queue agent did not save its plan")
-    expected = min(run["max_claims"], len(waiting))
-    if run["run_type"] == "queue" and len(run["todos"]) != expected:
-        raise RuntimeError("The queue agent did not select the full capped batch")
-    totals = {"approve": 0, "decline": 0, "refer": 0}
-    handler_count = 0
-    for todo in run["todos"]:
-        if os.getenv("UNDERCOVER_AGENT_TEST_MODE") == "1" and scheduled_stub_miss(
-            todo["claim_id"]
-        ):
-            api.update_run_todo(run_id, todo["todo_id"], "in progress")
-            api.fail_run_attempt(
-                run_id,
-                todo["claim_id"],
-                "Test-only interrupted attempt before reconciliation.",
-            )
-            continue
-        outcome, needs_handler = _process_todo(run_id, todo, saver, graph)
-        if outcome is not None:
-            totals[outcome] += 1
-        handler_count += int(needs_handler)
-    for todo in api.get_run(run_id)["todos"]:
-        if todo["status"] in {"done", "left for handler"}:
-            continue
-        outcome, needs_handler = _process_todo(run_id, todo, saver, graph)
-        if outcome is not None:
-            totals[outcome] += 1
-        handler_count += int(needs_handler)
-    latest = api.get_run(run_id)
-    if any(
-        item["status"] not in {"done", "left for handler"} for item in latest["todos"]
-    ):
-        raise RuntimeError("The run reconciliation found unfinished claims")
-    summary = (
-        f"Reviewed {len(latest['todos'])} claims: {totals['approve']} approved, "
-        f"{totals['decline']} declined, {totals['refer']} referred, "
-        f"{handler_count} need handler attention."
-    )
-    api.complete_run(run_id, summary)
-    return summary
-
-
-def run_queue(
-    cap: int,
-    llm: BaseChatModel | None = None,
-    graph: Any | None = None,
-    saver: Any | None = None,
-) -> str:
-    """Carry on saved claim work, then create and process a capped queue run."""
-    active_saver = saver or InMemorySaver()
-    latest = api.get_latest_run()
-    if latest is not None and latest["status"] == "in progress":
-        api.interrupt_run(latest["run_id"])
-    reports = []
-    for claim in api.get_queue_claims():
-        if claim["status"] != "in progress":
-            continue
-        claim_graph = graph or build_claim_graph(model(claim["claim_id"]), active_saver)
-        reports.append(carry_on(claim["claim_id"], claim_graph))
-    for report in reports:
-        print(report)
-    waiting = [
-        claim for claim in api.get_queue_claims() if claim["status"] == "waiting"
-    ]
-    if not waiting:
-        return "No claims are waiting"
-    run_id = api.create_direct_run(cap)
-    return process_saved_run(run_id, active_saver, graph, llm)
 
 
 def run_claim_direct(claim_id: str, saver: Any) -> str:

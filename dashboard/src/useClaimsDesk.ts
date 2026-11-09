@@ -12,7 +12,7 @@ import {
 export type DeskView = "queue" | "instructions";
 
 interface Instructions {
-  claim_instructions: string;
+  claim: string;
 }
 
 function useClaimPolling(

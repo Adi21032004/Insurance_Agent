@@ -314,7 +314,7 @@ export function getClaim(claimId: string): Promise<ClaimDetail> {
 }
 
 export function getInstructions(): Promise<{
-  claim_instructions: string;
+  claim: string;
 }> {
   return request("/api/instructions");
 }

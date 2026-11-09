@@ -10,6 +10,10 @@
 - TypeScript: ESLint, Prettier, tsc, and vitest with 80% coverage
 - Playwright end-to-end tests
 
+The automated checks use stub models, an agent-service stand-in and temporary SQLite databases. They do not need a live model, Supabase or Langfuse. Verify dispatch concurrency through the stub-model tests; do not start a live dispatch or evaluation as part of the automated check.
+
+The queue's old five-claim cap is replaced by a dispatch that works every eligible claim while limiting how many claim agents run at once. For manual acceptance, start a dispatch from the queue page after reseeding, and start evaluations from the Scoreboard without reseeding between them. Keep those live checks separate from `npm run check`.
+
 The pre-commit hook runs the format, lint, type and unit test checks on every commit.
 
 ## Planning
@@ -39,6 +43,7 @@ When the last phase is done, run `npm run check` and report the results.
 - Never use `git commit --no-verify`.
 - Never lower a threshold, turn off a rule or exclude a file to get a green run. If a rule looks wrong, stop and ask.
 - Keep `docs/STATUS.md` up to date.
+- Mark live-model, Supabase and Langfuse acceptance criteria complete only after they have actually been run and observed.
 - Never push.
 - Don't open `data/evals/` unless you're asked to.
 - Everything must work on Windows: write `package.json` scripts as `uv run` commands or `.mjs` files.
