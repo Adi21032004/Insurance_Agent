@@ -1409,11 +1409,31 @@ def record_model_call(  # noqa: PLR0913, PLR0917
     if input_tokens < 0 or output_tokens < 0 or cost < 0:
         raise ValueError("Tokens and cost cannot be negative")
     with connection() as db:
+        claim = db.execute(
+            "SELECT status, thread_id FROM claims WHERE claim_id = ?", (claim_id,)
+        ).fetchone()
+        if claim is None:
+            raise KeyError(claim_id)
+        if claim["status"] == "waiting":
+            raise ValueError("Claim has not been started")
+        if (
+            run_id is not None
+            and db.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            is None
+        ):
+            raise KeyError(run_id)
         db.execute(
             "INSERT INTO model_calls (claim_id, thread_id, run_id, "
             "input_tokens, output_tokens, cost, recorded_at) "
             "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-            (claim_id, thread_id, run_id, input_tokens, output_tokens, cost),
+            (
+                claim_id,
+                thread_id or claim["thread_id"],
+                run_id,
+                input_tokens,
+                output_tokens,
+                cost,
+            ),
         )
 
 
@@ -1429,10 +1449,23 @@ def record_work_time(
         raise ValueError("Seconds cannot be negative")
     recorded = started_at or datetime.now(UTC).isoformat()
     with connection() as db:
+        claim = db.execute(
+            "SELECT status, thread_id FROM claims WHERE claim_id = ?", (claim_id,)
+        ).fetchone()
+        if claim is None:
+            raise KeyError(claim_id)
+        if claim["status"] == "waiting":
+            raise ValueError("Claim has not been started")
+        if (
+            run_id is not None
+            and db.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            is None
+        ):
+            raise KeyError(run_id)
         db.execute(
             "INSERT INTO work_times (claim_id, thread_id, run_id, "
             "started_at, seconds) VALUES (?, ?, ?, ?, ?)",
-            (claim_id, thread_id, run_id, recorded, seconds),
+            (claim_id, thread_id or claim["thread_id"], run_id, recorded, seconds),
         )
 
 

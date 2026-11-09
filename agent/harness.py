@@ -4,6 +4,7 @@ import contextvars
 import json
 import logging
 import os
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from importlib import import_module
@@ -63,6 +64,16 @@ def claim_agent_node(
         raise TooManyModelCalls(f"The claim agent made {MAX_MODEL_CALLS} model calls.")
     reply = model_with_tools.invoke([SystemMessage(instructions), *state["messages"]])
     claim_id = runtime.context["claim_id"]
+    token_usage = reply.response_metadata.get("token_usage", {})
+    if not isinstance(token_usage, dict):
+        token_usage = {}
+    api.record_model_call(
+        claim_id,
+        runtime.context.get("run_id"),
+        int(token_usage.get("prompt_tokens", token_usage.get("input_tokens", 0))),
+        int(token_usage.get("completion_tokens", token_usage.get("output_tokens", 0))),
+        float(token_usage.get("cost", 0)),
+    )
     for call in reply.tool_calls:
         api.record_progress(
             claim_id,
@@ -220,11 +231,15 @@ def _invoke(  # noqa: PLR0913, PLR0917
 ) -> Any:
     """Invoke the claim graph as a root Langfuse run and save each step."""
     config = _config(claim_id, thread_id, trace_name, run_id)
-    context = {"claim_id": claim_id, "run_id": run_id}
+    context = {"claim_id": claim_id, "run_id": run_id, "thread_id": thread_id}
     current_context = contextvars.Context()
-    return current_context.run(
-        lambda: graph.invoke(value, config, context=context, durability="sync")
-    )
+    started = time.monotonic()
+    try:
+        return current_context.run(
+            lambda: graph.invoke(value, config, context=context, durability="sync")
+        )
+    finally:
+        api.record_work_time(claim_id, run_id, time.monotonic() - started)
 
 
 def _thread_id(claim_id: str, record: dict[str, Any]) -> str:

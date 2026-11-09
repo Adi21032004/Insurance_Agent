@@ -35,6 +35,7 @@ from backend.schemas import (
     KnowledgeSearchInput,
     LineDecisionInput,
     LinePayoutInput,
+    ModelCallInput,
     PaymentInput,
     PayoutInput,
     ProgressInput,
@@ -47,6 +48,7 @@ from backend.schemas import (
     RunTodoStatusInput,
     SignOffInput,
     ThreadInput,
+    WorkTimeInput,
 )
 
 
@@ -621,6 +623,48 @@ def record_claim_progress(claim_id: str, request: ProgressInput) -> dict[str, st
     require_in_progress(record)
     database.add_event(claim_id, request.step, request.detail)
     return {"status": "ok"}
+
+
+@app.post(
+    "/api/claims/{claim_id}/model-calls",
+    operation_id="record_model_call",
+)
+def record_model_call(claim_id: str, request: ModelCallInput) -> dict[str, str]:
+    """Record the token usage and cost of one claim model call."""
+    record = claim_or_404(claim_id)
+    if record["status"] == "waiting":
+        raise HTTPException(status_code=409, detail="Claim has not been started")
+    if request.run_id is not None and database.get_run(request.run_id) is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    database.record_model_call(
+        claim_id,
+        request.input_tokens,
+        request.output_tokens,
+        request.cost,
+        request.run_id,
+        record["thread_id"],
+    )
+    return {"status": "recorded"}
+
+
+@app.post(
+    "/api/claims/{claim_id}/work-times",
+    operation_id="record_work_time",
+)
+def record_work_time(claim_id: str, request: WorkTimeInput) -> dict[str, str]:
+    """Record the duration of one claim-agent invocation."""
+    record = claim_or_404(claim_id)
+    if record["status"] == "waiting":
+        raise HTTPException(status_code=409, detail="Claim has not been started")
+    if request.run_id is not None and database.get_run(request.run_id) is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    database.record_work_time(
+        claim_id,
+        request.seconds,
+        request.run_id,
+        record["thread_id"],
+    )
+    return {"status": "recorded"}
 
 
 @app.post(

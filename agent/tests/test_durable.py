@@ -151,6 +151,41 @@ def test_within_limit_approval_is_paid_by_the_graph(backend_client: TestClient):
     assert carry_on("CLM-1001", graph) == report
 
 
+def test_dispatch_claim_work_records_model_usage_and_elapsed_time(
+    backend_client: TestClient,
+):
+    run_id = "usage-dispatch"
+    database.create_dispatch(run_id, 1, "test-model", "low")
+    database.record_run_claims(run_id, ["CLM-1001"])
+
+    report = harness.work_in_run(
+        "CLM-1001",
+        run_id,
+        lambda: build_claim_graph(durable_stub_model("CLM-1001"), InMemorySaver()),
+    )
+    with database.connection() as db:
+        model_calls = db.execute(
+            "SELECT claim_id, thread_id, run_id, input_tokens, output_tokens, cost "
+            "FROM model_calls WHERE run_id = ?",
+            (run_id,),
+        ).fetchall()
+        work_times = db.execute(
+            "SELECT claim_id, thread_id, run_id, seconds FROM work_times "
+            "WHERE run_id = ?",
+            (run_id,),
+        ).fetchall()
+
+    assert report.startswith("CLM-1001")
+    assert model_calls
+    assert all(call["claim_id"] == "CLM-1001" for call in model_calls)
+    assert all(call["thread_id"] for call in model_calls)
+    assert all(call["input_tokens"] == 0 for call in model_calls)
+    assert len(work_times) == 1
+    assert work_times[0]["claim_id"] == "CLM-1001"
+    assert work_times[0]["thread_id"]
+    assert work_times[0]["seconds"] >= 0
+
+
 def test_sign_off_resumes_the_saved_graph_and_pays_once(backend_client: TestClient):
     database.set_claim_status("CLM-1003", "in progress")
     saver = InMemorySaver()

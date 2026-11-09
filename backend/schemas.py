@@ -99,6 +99,22 @@ class ThreadInput(BaseModel):
     thread_id: str = Field(min_length=1)
 
 
+class ModelCallInput(BaseModel):
+    """Token and cost usage recorded for one claim model response."""
+
+    run_id: str | None
+    input_tokens: int = Field(ge=0)
+    output_tokens: int = Field(ge=0)
+    cost: float = Field(ge=0)
+
+
+class WorkTimeInput(BaseModel):
+    """Duration recorded for one claim work invocation."""
+
+    run_id: str | None
+    seconds: float = Field(ge=0)
+
+
 class RunTodoItemInput(BaseModel):
     """One claim and description in the queue agent's work plan."""
 

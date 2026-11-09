@@ -16,6 +16,7 @@ class ClaimContext(TypedDict):
 
     claim_id: str
     run_id: NotRequired[str | None]
+    thread_id: NotRequired[str]
 
 
 Source = Literal["policy_wording", "claims_manual"]

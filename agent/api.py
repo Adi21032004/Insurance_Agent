@@ -74,6 +74,37 @@ def record_progress(claim_id: str, step: str, detail: str) -> None:
     response.raise_for_status()
 
 
+def record_model_call(
+    claim_id: str,
+    run_id: str | None,
+    input_tokens: int,
+    output_tokens: int,
+    cost: float,
+) -> None:
+    """Persist token usage and cost for one model response."""
+    with backend() as client:
+        response = client.post(
+            f"/api/claims/{claim_id}/model-calls",
+            json={
+                "run_id": run_id,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cost": cost,
+            },
+        )
+    response.raise_for_status()
+
+
+def record_work_time(claim_id: str, run_id: str | None, seconds: float) -> None:
+    """Persist the duration of one claim-agent invocation."""
+    with backend() as client:
+        response = client.post(
+            f"/api/claims/{claim_id}/work-times",
+            json={"run_id": run_id, "seconds": seconds},
+        )
+    response.raise_for_status()
+
+
 def calculate_payout(
     claim_id: str,
     benefit: str,
