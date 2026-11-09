@@ -266,6 +266,13 @@ def stop_runs() -> None:
     response.raise_for_status()
 
 
+def start_claim_direct(claim_id: str) -> None:
+    """Reserve one waiting claim for a direct claim-agent invocation."""
+    with backend() as client:
+        response = client.post(f"/api/claims/{claim_id}/run/direct")
+    response.raise_for_status()
+
+
 def create_direct_run(max_claims: int) -> str:
     """Create a queue run that the current caller will process."""
     with backend() as client:

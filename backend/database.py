@@ -1041,6 +1041,37 @@ def set_claim_status(claim_id: str, status: str) -> None:
         raise KeyError(claim_id)
 
 
+def start_direct_claim(claim_id: str) -> None:
+    """Reserve one waiting claim for a direct, untracked agent run."""
+    with engine().begin() as db:
+        active_run = db.execute(
+            select(runs_table.c.run_id)
+            .where(runs_table.c.status.in_(("in progress", "running")))
+            .limit(1)
+        ).first()
+        if active_run is not None:
+            raise ValueError("A dispatch or evaluation is already running")
+        record = db.execute(
+            select(claims_table.c.status, claims_table.c.evaluation_id)
+            .where(claims_table.c.claim_id == claim_id)
+            .with_for_update()
+        ).first()
+        if record is None:
+            raise KeyError(claim_id)
+        if record.status != "waiting" or record.evaluation_id is not None:
+            raise ValueError("Claim is not waiting")
+        db.execute(
+            claims_table.update()
+            .where(claims_table.c.claim_id == claim_id)
+            .values(
+                status="in progress",
+                run_id=None,
+                thread_id=None,
+                lease_at=text("CURRENT_TIMESTAMP"),
+            )
+        )
+
+
 def set_claim_thread_id(claim_id: str, thread_id: str) -> str:
     """Save the first thread id for an in-progress claim attempt."""
     with connection() as db:

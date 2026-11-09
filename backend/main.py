@@ -608,14 +608,15 @@ def start_claim(claim_id: str, background_tasks: BackgroundTasks) -> dict[str, s
 
 @app.post("/api/claims/{claim_id}/run/direct", operation_id="start_direct_claim_run")
 def start_direct_claim_run(claim_id: str) -> dict[str, str]:
-    """Create a named claim run for an agent command-line caller."""
-    if database.get_current_run() is not None:
-        raise active_run_conflict()
-    record = claim_or_404(claim_id)
-    if record["status"] != "waiting":
-        raise HTTPException(status_code=409, detail="Claim is not waiting")
-    run_id = create_run_for_claim(claim_id)
-    return {"status": "in progress", "run_id": run_id}
+    """Reserve a waiting claim for an untracked direct agent run."""
+    try:
+        database.start_direct_claim(claim_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Claim not found") from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    database.add_event(claim_id, "Review started", "Assigned to a direct claim run.")
+    return {"status": "in progress"}
 
 
 @app.post("/api/claims/{claim_id}/progress", operation_id="record_claim_progress")

@@ -644,6 +644,12 @@ def run_queue(
 
 
 def run_claim_direct(claim_id: str, saver: Any) -> str:
-    """Create and process a one-claim run from the command line."""
-    run_id = api.create_direct_claim_run(claim_id)
-    return process_saved_run(run_id, saver)
+    """Run one claim directly without creating a dispatch or evaluation."""
+    record = api.get_agent_claim(claim_id)
+    if record["status"] == "waiting":
+        api.start_claim_direct(claim_id)
+        record = api.get_agent_claim(claim_id)
+    graph = claim_graphs(saver)(claim_id)
+    if record["status"] == "in progress" and record["thread_id"] is not None:
+        return carry_on(claim_id, graph)
+    return work_claim(claim_id, graph, record["thread_id"])

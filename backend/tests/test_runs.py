@@ -899,6 +899,16 @@ def test_named_claim_creates_a_one_item_run(
     assert run["todos"][0]["status"] == "to do"
 
 
+def test_direct_claim_run_starts_without_creating_a_run(client: TestClient):
+    response = client.post("/api/claims/CLM-1001/run/direct")
+    claim = client.get("/api/claims/CLM-1001").json()
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "in progress"}
+    assert claim["status"] == "in progress"
+    assert database.get_latest_run() is None
+
+
 def test_queue_cannot_close_with_a_short_batch_or_unresolved_claim(
     client: TestClient,
 ):
