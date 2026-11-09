@@ -1,3 +1,4 @@
+
 # Plan: durable state
 
 This plan builds what `docs/DURABLE.md` asks for on top of the finished harness, in six phases. Each phase leaves `npm run check` green and is committed before the next one starts.

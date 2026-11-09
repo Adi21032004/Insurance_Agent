@@ -14,6 +14,7 @@ from uuid import uuid4
 from sqlalchemy import (
     JSON,
     Column,
+    Float,
     ForeignKey,
     Integer,
     MetaData,
@@ -138,6 +139,76 @@ runs_table = Table(
     ),
     Column("finished_at", String),
     Column("heartbeat_at", String),
+    Column("kind", String),
+    Column("model", String),
+    Column("reasoning_effort", String),
+    Column("evaluation_set", String),
+    Column("tiny", Integer),
+)
+
+
+def _bool_to_int(value: bool | None) -> int | None:
+    if value is None:
+        return None
+    return int(value)
+
+
+run_claims_table = Table(
+    "run_claims",
+    metadata,
+    Column("run_claim_id", Integer, primary_key=True, autoincrement=True),
+    Column("run_id", String, nullable=False),
+    Column("claim_id", String, nullable=False),
+    Column("position", Integer, nullable=False),
+    Column("started_at", String),
+    Column("seconds", Float),
+    Column("model_cost", Float),
+    Column("decision", Text),
+    Column("payout_inr", Float),
+)
+
+model_calls_table = Table(
+    "model_calls",
+    metadata,
+    Column("call_id", Integer, primary_key=True, autoincrement=True),
+    Column("claim_id", String, nullable=False),
+    Column("thread_id", String),
+    Column("run_id", String),
+    Column("input_tokens", Integer, nullable=False),
+    Column("output_tokens", Integer, nullable=False),
+    Column("cost", Float, nullable=False),
+    Column(
+        "recorded_at", String, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    ),
+)
+
+work_times_table = Table(
+    "work_times",
+    metadata,
+    Column("work_time_id", Integer, primary_key=True, autoincrement=True),
+    Column("claim_id", String, nullable=False),
+    Column("thread_id", String),
+    Column("run_id", String),
+    Column("started_at", String, nullable=False),
+    Column("seconds", Float, nullable=False),
+)
+
+held_out_claims_table = Table(
+    "held_out_claims",
+    metadata,
+    Column("claim_id", String, primary_key=True),
+    Column("record", Text, nullable=False),
+)
+
+handler_decisions_table = Table(
+    "handler_decisions",
+    metadata,
+    Column("decision_id", Integer, primary_key=True, autoincrement=True),
+    Column("evaluation_set", String, nullable=False),
+    Column("claim_id", String, nullable=False),
+    Column("decision", String, nullable=False),
+    Column("payout", Float, nullable=False),
+    Column("tiny", Integer, nullable=False),
 )
 todos_table = Table(
     "todos",
@@ -567,6 +638,11 @@ def ensure_workflow_columns(db: CoreConnection) -> None:
         ("selection_complete", "INTEGER NOT NULL DEFAULT 0"),
         ("required_claims", "INTEGER"),
         ("heartbeat_at", "TEXT"),
+        ("kind", "TEXT"),
+        ("model", "TEXT"),
+        ("reasoning_effort", "TEXT"),
+        ("evaluation_set", "TEXT"),
+        ("tiny", "INTEGER"),
     ):
         if name not in run_columns:
             db.execute(f"ALTER TABLE runs ADD COLUMN {name} {declaration}")
@@ -1184,6 +1260,138 @@ def get_latest_run() -> dict[str, Any] | None:
             "SELECT run_id FROM runs ORDER BY run_order DESC LIMIT 1"
         ).fetchone()
     return get_run(row["run_id"]) if row is not None else None
+
+
+def create_dispatch(
+    run_id: str, agents: int, model: str, reasoning_effort: str
+) -> dict[str, Any]:
+    """Create a persisted dispatch run and return its summary."""
+    create_run(run_id, "dispatch", agents)
+    with connection() as db:
+        db.execute(
+            "UPDATE runs SET kind = 'dispatch', model = ?, "
+            "reasoning_effort = ? WHERE run_id = ?",
+            (model, reasoning_effort, run_id),
+        )
+    return get_run(run_id) or {}
+
+
+def create_evaluation(  # noqa: PLR0913, PLR0917
+    run_id: str,
+    evaluation_set: str,
+    tiny: bool,
+    agents: int,
+    model: str,
+    reasoning_effort: str,
+) -> dict[str, Any]:
+    """Create a persisted evaluation run and return its summary."""
+    create_run(run_id, "evaluation", agents)
+    with connection() as db:
+        db.execute(
+            "UPDATE runs SET kind = 'evaluation', evaluation_set = ?, "
+            "tiny = ?, model = ?, reasoning_effort = ? WHERE run_id = ?",
+            (evaluation_set, _bool_to_int(tiny), model, reasoning_effort, run_id),
+        )
+    return get_run(run_id) or {}
+
+
+def record_run_claims(run_id: str, claim_ids: list[str]) -> None:
+    """Persist the in-order claims that a run is working."""
+    with connection() as db:
+        for position, claim_id in enumerate(claim_ids):
+            db.execute(
+                "INSERT OR REPLACE INTO run_claims "
+                "(run_id, claim_id, position) VALUES (?, ?, ?)",
+                (run_id, claim_id, position),
+            )
+
+
+def finish_run_summary(run_id: str, summary: str) -> None:
+    """Finish a run and save its summary."""
+    finish_run(run_id, summary)
+
+
+def stop_runs() -> list[str]:
+    """Mark every running run as stopped and return their ids."""
+    with connection() as db:
+        rows = db.execute(
+            "SELECT run_id FROM runs WHERE status = 'in progress'"
+        ).fetchall()
+        run_ids = [row["run_id"] for row in rows]
+        db.execute(
+            "UPDATE runs SET status = 'stopped', "
+            "finished_at = CURRENT_TIMESTAMP WHERE status = 'in progress'"
+        )
+    return run_ids
+
+
+def get_latest_dispatch() -> dict[str, Any] | None:
+    """Return the newest dispatch with claim details and summary."""
+    with connection() as db:
+        row = db.execute(
+            "SELECT run_id FROM runs WHERE run_type = 'dispatch' "
+            "OR kind = 'dispatch' ORDER BY run_order DESC LIMIT 1"
+        ).fetchone()
+    return get_run(row["run_id"]) if row is not None else None
+
+
+def list_evaluations() -> list[dict[str, Any]]:
+    """Return every evaluation newest first."""
+    with connection() as db:
+        rows = db.execute(
+            "SELECT run_id FROM runs WHERE run_type = 'evaluation' "
+            "OR kind = 'evaluation' ORDER BY run_order DESC"
+        ).fetchall()
+    return [get_run(row["run_id"]) or {} for row in rows]
+
+
+def get_evaluation(run_id: str) -> dict[str, Any] | None:
+    """Return one evaluation if present."""
+    run = get_run(run_id)
+    if run is None:
+        return None
+    if run.get("run_type") != "evaluation" and run.get("kind") != "evaluation":
+        return None
+    return run
+
+
+def record_model_call(  # noqa: PLR0913, PLR0917
+    claim_id: str,
+    input_tokens: int,
+    output_tokens: int,
+    cost: float,
+    run_id: str | None = None,
+    thread_id: str | None = None,
+) -> None:
+    """Record a model call on a claim, optionally tied to a run."""
+    if input_tokens < 0 or output_tokens < 0 or cost < 0:
+        raise ValueError("Tokens and cost cannot be negative")
+    with connection() as db:
+        db.execute(
+            "INSERT INTO model_calls (claim_id, thread_id, run_id, "
+            "input_tokens, output_tokens, cost, recorded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            (claim_id, thread_id, run_id, input_tokens, output_tokens, cost),
+        )
+
+
+def record_work_time(
+    claim_id: str,
+    seconds: float,
+    run_id: str | None = None,
+    thread_id: str | None = None,
+    started_at: str | None = None,
+) -> None:
+    """Record a claim work spell with duration and optional run metadata."""
+    if seconds < 0:
+        raise ValueError("Seconds cannot be negative")
+    recorded = started_at or datetime.now(UTC).isoformat()
+    with connection() as db:
+        db.execute(
+            "INSERT INTO work_times (claim_id, thread_id, run_id, "
+            "started_at, seconds) VALUES (?, ?, ?, ?, ?)",
+            (claim_id, thread_id, run_id, recorded, seconds),
+        )
 
 
 def set_todo_status(todo_id: int, status: str) -> None:

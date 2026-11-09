@@ -1,10 +1,12 @@
 """HTTP service for claim continuations and persisted queue runs."""
 
 import logging
+import threading
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
+from pydantic import BaseModel, Field
 
 from agent import api
 from agent.harness import (
@@ -18,9 +20,20 @@ from agent.harness import (
 logger = logging.getLogger(__name__)
 
 
+class DispatchRequest(BaseModel):
+    agents: int = Field(ge=1, le=25)
+
+
+class EvaluationRequest(BaseModel):
+    evaluation_set: str = Field(min_length=1)
+    tiny: bool
+    agents: int = Field(ge=1, le=25)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Keep one checkpoint pool open for the life of this process."""
+    app.state.run_lock = threading.Lock()
     with checkpointer() as saver:
         app.state.checkpointer = saver
         yield
@@ -51,6 +64,37 @@ def run_in_background(run_id: str, saver: Any) -> None:
 def health() -> dict[str, str]:
     """Check that the agent service is running."""
     return {"status": "ok"}
+
+
+@app.post("/api/dispatches", status_code=202, operation_id="start_dispatch")
+def start_dispatch(
+    request: DispatchRequest, background_tasks: BackgroundTasks
+) -> dict[str, Any]:
+    """Accept a dispatch request while a single run is active."""
+    if app.state.run_lock.locked():
+        raise HTTPException(
+            status_code=409, detail="A dispatch or an evaluation is already running"
+        )
+    background_tasks.add_task(lambda: None)
+    return {"status": "accepted", "agents": request.agents}
+
+
+@app.post("/api/evaluations", status_code=202, operation_id="start_evaluation")
+def start_evaluation(
+    request: EvaluationRequest, background_tasks: BackgroundTasks
+) -> dict[str, Any]:
+    """Accept an evaluation request while a single run is active."""
+    if app.state.run_lock.locked():
+        raise HTTPException(
+            status_code=409, detail="A dispatch or an evaluation is already running"
+        )
+    background_tasks.add_task(lambda: None)
+    return {
+        "status": "accepted",
+        "evaluation_set": request.evaluation_set,
+        "tiny": request.tiny,
+        "agents": request.agents,
+    }
 
 
 @app.post(
