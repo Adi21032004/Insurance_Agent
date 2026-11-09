@@ -575,7 +575,7 @@ def test_model_respects_model_name_and_defaults(monkeypatch):
     monkeypatch.delenv("MODEL_NAME", raising=False)
     default_model = main.model()
     assert isinstance(default_model, FakeChatOpenAI)
-    assert default_model.model_name == "deepseek/deepseek-v4.1-flash"
+    assert default_model.model_name == "openai/gpt-6-luna"
     assert default_model.reasoning_effort == "low"
     assert default_model.request_timeout == main.CLAIM_TIMEOUT_SECONDS
     monkeypatch.setenv("MODEL_NAME", "openrouter/free")
