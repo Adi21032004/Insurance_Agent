@@ -3,6 +3,7 @@ import { createServer, request as httpRequest } from "node:http";
 const port = Number(process.env.AGENT_STAND_IN_PORT ?? "8003");
 const upstreamPort = Number(process.env.AGENT_STAND_IN_UPSTREAM_PORT ?? "8002");
 const resumed: string[] = [];
+const started: { path: string; body: Record<string, unknown> }[] = [];
 
 const server = createServer((incoming, outgoing) => {
   const url = new URL(incoming.url ?? "/", "http://127.0.0.1");
@@ -14,6 +15,30 @@ const server = createServer((incoming, outgoing) => {
   if (incoming.method === "GET" && url.pathname === "/api/resumed") {
     outgoing.writeHead(200, { "Content-Type": "application/json" });
     outgoing.end(JSON.stringify({ claim_ids: resumed }));
+    return;
+  }
+  if (incoming.method === "GET" && url.pathname === "/api/started") {
+    outgoing.writeHead(200, { "Content-Type": "application/json" });
+    outgoing.end(JSON.stringify({ requests: started }));
+    return;
+  }
+  if (
+    incoming.method === "POST" &&
+    (url.pathname === "/api/dispatches" || url.pathname === "/api/evaluations")
+  ) {
+    let body = "";
+    incoming.setEncoding("utf8");
+    incoming.on("data", (chunk: string) => {
+      body += chunk;
+    });
+    incoming.on("end", () => {
+      started.push({
+        path: url.pathname,
+        body: JSON.parse(body) as Record<string, unknown>,
+      });
+      outgoing.writeHead(202, { "Content-Type": "application/json" });
+      outgoing.end(JSON.stringify({ status: "accepted" }));
+    });
     return;
   }
   const resume = /^\/api\/claims\/([^/]+)\/resume$/.exec(url.pathname);

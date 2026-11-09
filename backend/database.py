@@ -1375,6 +1375,17 @@ def get_run(run_id: str) -> dict[str, Any] | None:
         ).fetchone()
     run = dict(row)
     run["agents"] = run["max_claims"]
+    run["run_seconds"] = (
+        max(
+            0.0,
+            (
+                datetime.fromisoformat(run["finished_at"])
+                - datetime.fromisoformat(run["created_at"])
+            ).total_seconds(),
+        )
+        if run["finished_at"] is not None
+        else None
+    )
     if run["run_type"] == "dispatch" or run["kind"] == "dispatch":
         run["status"] = {
             "in progress": "running",

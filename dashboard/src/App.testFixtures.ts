@@ -1,9 +1,10 @@
 import { vi } from "vitest";
 import type {
-  AgentRun,
   ClaimDetail,
   ClaimStatus,
   ClaimSummary,
+  EvaluationRun,
+  DispatchRun,
   Decision,
   ProgressEvent,
 } from "./api";
@@ -183,28 +184,80 @@ export function makeDetail(
   };
 }
 
-export function makeRun(
-  status: AgentRun["status"] = "completed",
-  maxClaims = 5,
-): AgentRun {
+export function makeDispatch(
+  status: DispatchRun["status"] = "finished",
+  agents = 3,
+): DispatchRun {
   return {
-    run_id: "RUN-0001",
-    run_type: "queue",
-    max_claims: maxClaims,
+    run_id: "dispatch-1",
+    run_order: 1,
     status,
+    agents,
+    model: "openai/gpt-6-luna",
+    reasoning_effort: "low",
+    created_at: "2026-10-17T14:00:00",
+    finished_at: status === "running" ? null : "2026-10-17T14:01:00",
     summary:
-      status === "completed"
-        ? `Reviewed ${maxClaims.toString()} claims: 3 approved, 1 declined, 1 referred, 0 need handler attention.`
+      status === "finished"
+        ? {
+            approved: 1,
+            declined: 0,
+            referred: 0,
+            waiting_for_sign_off: [],
+            left_for_handler: [],
+            unfinished: [],
+          }
         : null,
-    todos: Array.from({ length: maxClaims }, (_, index) => ({
-      todo_id: index + 1,
-      position: index,
-      claim_id: `CLM-${(1001 + index).toString()}`,
-      description: `Review CLM-${(1001 + index).toString()}`,
-      status:
-        status === "completed" ? ("done" as const) : ("in progress" as const),
-      attempt_count: 1,
-    })),
+    model_cost: 0.0125,
+    seconds: 40,
+    run_seconds: status === "finished" ? 60 : null,
+    claims: [
+      {
+        claim_id: "CLM-1001",
+        customer_name: "Maya Patel",
+        summary: "Flight home canceled by the airline",
+        status: status === "running" ? "in progress" : "decided",
+        decision: approvedDecision,
+        payout_inr: approvedDecision.payout_inr,
+        started_at: "2026-10-17T14:00:02",
+        seconds: 40,
+        model_cost: 0.0125,
+      },
+    ],
+  };
+}
+
+export function makeEvaluation(): EvaluationRun {
+  const dispatch = makeDispatch("finished", 3);
+  return {
+    ...dispatch,
+    status: "completed",
+    evaluation_set: "held_out",
+    tiny: true,
+    measures: {
+      decision_accuracy: 0.8,
+      accuracy: 0.4,
+      cost_of_mistakes: 620,
+      straight_through: 0.6,
+      model_cost_per_claim: 0.0125,
+      seconds_per_claim: 40,
+      run_seconds: 120,
+    },
+    claims: [
+      {
+        ...dispatch.claims[0],
+        claim_id: "CLM-1104-E1",
+        copy_of: "CLM-1104",
+        handler_decision: "approve",
+        handler_payout: 250,
+        agent_decision: "approve",
+        agent_payout: 250,
+        right: true,
+        decision_right: true,
+        mistake_cost: 0,
+        reason: "The evidence supports the claim.",
+      },
+    ],
   };
 }
 
@@ -218,27 +271,15 @@ export function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status });
 }
 
-function queueMaxClaims(init?: RequestInit): number {
-  if (typeof init?.body !== "string") {
-    throw new Error("Queue run request body must be JSON text.");
-  }
-  const body = JSON.parse(init.body) as { max_claims: number };
-  return body.max_claims;
-}
-
 export function mockApi(initialDetail: ClaimDetail = makeDetail()) {
   let currentDetail = initialDetail;
   const instructions = {
-    queue_instructions: "Choose the ordered batch and keep its tasks current.",
     claim_instructions: "Use the policy wording and claims manual.",
   };
-  let savedRun: AgentRun | null = null;
+  let savedDispatch: DispatchRun | null = null;
   const getRoutes: Partial<Record<string, (init?: RequestInit) => Response>> = {
-    "/api/agent/runs/current": () =>
-      jsonResponse({
-        run: savedRun?.status === "in progress" ? savedRun : null,
-      }),
-    "/api/agent/runs/RUN-0001": () => jsonResponse(savedRun ?? makeRun()),
+    "/api/dispatches/latest": () => jsonResponse(savedDispatch),
+    "/api/evaluations": () => jsonResponse([]),
     "/api/claims": () =>
       jsonResponse({
         claims: [makeSummary(currentDetail.status, currentDetail.decision)],
@@ -248,35 +289,22 @@ export function mockApi(initialDetail: ClaimDetail = makeDetail()) {
   };
   const postRoutes: Partial<Record<string, (init?: RequestInit) => Response>> =
     {
-      "/api/agent/runs": (init) => {
-        const maxClaims = queueMaxClaims(init);
-        savedRun = makeRun("completed", maxClaims);
+      "/api/dispatches": (init) => {
+        if (typeof init?.body !== "string") {
+          throw new Error("Dispatch request body must be JSON text.");
+        }
+        const body = JSON.parse(init.body) as { agents: number };
+        savedDispatch = makeDispatch("running", body.agents);
         return jsonResponse({
-          run_id: savedRun.run_id,
-          status: "in progress",
-          max_claims: maxClaims,
+          status: "accepted",
+          agents: body.agents,
         });
       },
       "/api/claims/CLM-1001/run": () => {
-        savedRun = {
-          ...makeRun("completed", 1),
-          run_type: "claim",
-          todos: [
-            {
-              todo_id: 1,
-              position: 0,
-              claim_id: "CLM-1001",
-              description: "Review CLM-1001",
-              status: "done",
-              attempt_count: 1,
-            },
-          ],
-          summary: "Reviewed one claim.",
-        };
         currentDetail = makeDetail("decided", approvedDecision, null, null, [
           progressEvent,
         ]);
-        return jsonResponse({ status: "in progress", run_id: savedRun.run_id });
+        return jsonResponse({ status: "in progress", run_id: "claim-run-1" });
       },
       "/api/claims/CLM-1001/sign-off": () => {
         currentDetail = makeDetail("in progress", approvedDecision, "HND-01");

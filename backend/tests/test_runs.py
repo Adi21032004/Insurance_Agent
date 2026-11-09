@@ -187,6 +187,8 @@ def test_dispatch_finish_builds_summary_and_cost_time_totals_from_records(
         "unfinished": ["CLM-1001"],
     }
     assert run["status"] == "finished"
+    assert run["run_seconds"] is not None
+    assert run["run_seconds"] >= 0
     assert run["model_cost"] == pytest.approx(0.125)
     assert run["seconds"] == pytest.approx(0.75)
     assert run["claims"][0]["model_cost"] == pytest.approx(0.125)

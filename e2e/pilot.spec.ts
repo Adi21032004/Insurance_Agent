@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { resumedClaims } from "./api";
+import { resumedClaims, startedRequests } from "./api";
 
 test("the dashboard keeps the health check and completes a standard claim", async ({
   page,
@@ -21,6 +21,13 @@ test("the dashboard keeps the health check and completes a standard claim", asyn
   await expect(page.getByText("Approved", { exact: true })).toBeVisible();
   await expect(page.getByText("Paid ₹34,860.00")).toBeVisible();
   await expect(claim).toContainText("decided");
+  await page.getByRole("button", { name: "Agent instructions" }).click();
+  await expect(
+    page.getByRole("heading", { name: "Claim agent" }),
+  ).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Queue agent" })).toHaveCount(
+    0,
+  );
 });
 
 test("an over-limit claim resumes after handler sign-off and is paid", async ({
@@ -60,66 +67,28 @@ test("an over-limit claim resumes after handler sign-off and is paid", async ({
   await expect(claim).toContainText("decided");
 });
 
-test("a capped queue run retries, routes a second failure and leaves other claims waiting", async ({
+test("the queue and scoreboard start dispatches and evaluations", async ({
   page,
 }) => {
-  const browserErrors: string[] = [];
-  page.on("console", (message) => {
-    if (message.type() === "error") browserErrors.push(message.text());
-  });
-  page.on("pageerror", (error) => browserErrors.push(error.message));
-
   await page.goto("/");
-  await page.getByLabel("Claims per run").fill("5");
-  await page.getByRole("button", { name: "Run queue" }).click();
+  await page.getByLabel("Claim agents at once").fill("7");
+  await page.getByRole("button", { name: "Start a dispatch" }).click();
+  await expect
+    .poll(() => startedRequests(page.request))
+    .toEqual([{ path: "/api/dispatches", body: { agents: 7 } }]);
 
-  await expect(
-    page.getByText(
-      "Reviewed 5 claims: 0 approved, 0 declined, 4 referred, 1 need handler attention.",
-    ),
-  ).toBeVisible({ timeout: 30000 });
-  const runPanel = page.getByRole("region", { name: "Agent run" });
-  await expect(runPanel.getByRole("listitem")).toHaveCount(5);
-
-  const retriedTodo = runPanel
-    .getByRole("listitem")
-    .filter({ hasText: "CLM-1007" });
-  await expect(retriedTodo).toContainText("Attempts: 2");
-  await expect(retriedTodo).toContainText("done");
-  const handlerTodo = runPanel
-    .getByRole("listitem")
-    .filter({ hasText: "CLM-1006" });
-  await expect(handlerTodo).toContainText("left for handler");
-  await expect(
-    runPanel.getByRole("listitem").filter({ hasText: "CLM-1002" }),
-  ).toContainText("done");
-  await expect(
-    runPanel.getByRole("listitem").filter({ hasText: "CLM-1002" }),
-  ).toContainText("Attempts: 2");
-  await expect(page.getByRole("button", { name: /CLM-1002/ })).toContainText(
-    "decided",
-  );
-  await expect(page.getByRole("button", { name: /CLM-1008/ })).toContainText(
-    "waiting",
-  );
-
-  await page.getByRole("button", { name: /CLM-1007/ }).click();
-  await expect(
-    page.getByRole("heading", { name: "Policy and manual sections read" }),
-  ).toBeVisible();
-  await expect(
-    page.getByText("Section 5: Baggage and Personal Effects", { exact: true }),
-  ).toBeVisible();
-  await expect(
-    page.getByText("claims_manual:05", { exact: true }),
-  ).toBeVisible();
-
-  await page.getByRole("button", { name: "Agent instructions" }).click();
-  await expect(
-    page.getByRole("heading", { name: "Queue agent" }),
-  ).toBeVisible();
-  await expect(
-    page.getByRole("heading", { name: "Claim agent" }),
-  ).toBeVisible();
-  expect(browserErrors).toEqual([]);
+  await page.getByRole("button", { name: "Scoreboard" }).click();
+  await page.getByLabel("Evaluation set").selectOption("held_out");
+  await page.getByLabel("Claims").selectOption("tiny");
+  await page.getByLabel("Claim agents at once").fill("5");
+  await page.getByRole("button", { name: "Start an evaluation" }).click();
+  await expect
+    .poll(() => startedRequests(page.request))
+    .toEqual([
+      { path: "/api/dispatches", body: { agents: 7 } },
+      {
+        path: "/api/evaluations",
+        body: { evaluation_set: "held_out", tiny: true, agents: 5 },
+      },
+    ]);
 });

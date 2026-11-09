@@ -5,9 +5,6 @@ export type ClaimStatus =
   | "decided"
   | "needs handler";
 
-export type RunTodoStatus =
-  "to do" | "in progress" | "done" | "left for handler";
-
 export type DecisionOutcome = "approve" | "decline" | "refer";
 
 export interface CalculationStep {
@@ -159,6 +156,8 @@ export interface ClaimDetail {
   failure_count: number;
   progress: ProgressEvent[];
   source_reads: SourceRead[];
+  evaluation_id?: string | null;
+  copy_of?: string | null;
 }
 
 export interface SourceRead {
@@ -170,22 +169,79 @@ export interface SourceRead {
   created_at: string;
 }
 
-export interface RunTodo {
-  todo_id: number;
-  position: number;
-  claim_id: string;
-  description: string;
-  status: RunTodoStatus;
-  attempt_count: number;
+export interface DispatchSummary {
+  approved: number;
+  declined: number;
+  referred: number;
+  waiting_for_sign_off: { claim_id: string; payout: number }[];
+  left_for_handler: string[];
+  unfinished: string[];
 }
 
-export interface AgentRun {
+export interface DispatchClaim {
+  claim_id: string;
+  customer_name: string;
+  summary: string;
+  status: ClaimStatus;
+  decision: Decision | null;
+  payout_inr: number | null;
+  started_at: string | null;
+  seconds: number | null;
+  model_cost: number;
+}
+
+export interface DispatchRun {
   run_id: string;
-  run_type: "queue" | "claim" | "recovery";
-  max_claims: number;
-  status: "in progress" | "completed" | "interrupted";
-  summary: string | null;
-  todos: RunTodo[];
+  run_order: number;
+  status: "running" | "finished" | "stopped";
+  agents: number;
+  model: string;
+  reasoning_effort: string;
+  created_at: string;
+  finished_at: string | null;
+  summary: DispatchSummary | null;
+  model_cost: number;
+  seconds: number;
+  run_seconds: number | null;
+  claims: DispatchClaim[];
+}
+
+export interface EvaluationClaim extends DispatchClaim {
+  copy_of: string;
+  handler_decision: DecisionOutcome;
+  handler_payout: number;
+  agent_decision: DecisionOutcome;
+  agent_payout: number;
+  right: boolean;
+  decision_right: boolean;
+  mistake_cost: number;
+  reason: string | null;
+}
+
+export interface EvaluationMeasures {
+  decision_accuracy: number;
+  accuracy: number;
+  cost_of_mistakes: number;
+  straight_through: number;
+  model_cost_per_claim: number;
+  seconds_per_claim: number;
+  run_seconds: number | null;
+}
+
+export interface EvaluationRun {
+  run_id: string;
+  run_order: number;
+  status: "in progress" | "completed" | "interrupted" | "stopped";
+  evaluation_set: "evaluation" | "held_out";
+  tiny: boolean;
+  agents: number;
+  model: string;
+  reasoning_effort: string;
+  created_at: string;
+  finished_at: string | null;
+  model_cost: number;
+  claims: EvaluationClaim[];
+  measures: EvaluationMeasures;
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -211,8 +267,46 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
+function post<T>(path: string, body: unknown): Promise<T> {
+  return request(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
 export function getClaims(): Promise<{ claims: ClaimSummary[] }> {
   return request("/api/claims");
+}
+
+export function getLatestDispatch(): Promise<DispatchRun | null> {
+  return request("/api/dispatches/latest");
+}
+
+export function startDispatch(
+  agents: number,
+): Promise<{ status: string; agents: number }> {
+  return post("/api/dispatches", { agents });
+}
+
+export function listEvaluations(): Promise<EvaluationRun[]> {
+  return request("/api/evaluations");
+}
+
+export function getEvaluation(runId: string): Promise<EvaluationRun> {
+  return request(`/api/evaluations/${runId}`);
+}
+
+export function startEvaluation(
+  evaluationSet: EvaluationRun["evaluation_set"],
+  tiny: boolean,
+  agents: number,
+): Promise<{ status: string; evaluation_set: string; tiny: boolean }> {
+  return post("/api/evaluations", {
+    evaluation_set: evaluationSet,
+    tiny,
+    agents,
+  });
 }
 
 export function getClaim(claimId: string): Promise<ClaimDetail> {
@@ -220,28 +314,9 @@ export function getClaim(claimId: string): Promise<ClaimDetail> {
 }
 
 export function getInstructions(): Promise<{
-  queue_instructions: string;
   claim_instructions: string;
 }> {
   return request("/api/instructions");
-}
-
-export function getCurrentRun(): Promise<{ run: AgentRun | null }> {
-  return request("/api/agent/runs/current");
-}
-
-export function getRun(runId: string): Promise<AgentRun> {
-  return request(`/api/agent/runs/${runId}`);
-}
-
-export function startQueueRun(
-  maxClaims: number,
-): Promise<{ run_id: string; status: string; max_claims: number }> {
-  return request("/api/agent/runs", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ max_claims: maxClaims }),
-  });
 }
 
 export function startClaim(
@@ -267,6 +342,27 @@ export function formatInr(amount: number): string {
     currency: "INR",
     minimumFractionDigits: 2,
   }).format(amount);
+}
+
+export function formatUsd(amount: number): string {
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 4,
+    maximumFractionDigits: 4,
+  }).format(amount);
+}
+
+export function formatDuration(seconds: number): string {
+  const totalSeconds = Math.round(seconds);
+  if (totalSeconds < 60) return `${totalSeconds.toString()} s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const remaining = totalSeconds % 60;
+  return `${minutes.toString()} min ${remaining.toString()} s`;
+}
+
+export function formatPercent(value: number): string {
+  return `${Math.round(value * 100).toString()}%`;
 }
 
 export function formatTime(timestamp: string | null | undefined): string {

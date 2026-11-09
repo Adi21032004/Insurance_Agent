@@ -1,6 +1,5 @@
 type InstructionsPageProps = Readonly<{
   instructions: {
-    queue_instructions: string;
     claim_instructions: string;
   } | null;
 }>;
@@ -14,20 +13,12 @@ export function InstructionsPage({ instructions }: InstructionsPageProps) {
       {instructions === null ? (
         <p>Loading instructions…</p>
       ) : (
-        <div className="instruction-grid">
-          <section>
-            <h3>Queue agent</h3>
-            <pre className="instruction-copy">
-              {instructions.queue_instructions}
-            </pre>
-          </section>
-          <section>
-            <h3>Claim agent</h3>
-            <pre className="instruction-copy">
-              {instructions.claim_instructions}
-            </pre>
-          </section>
-        </div>
+        <section>
+          <h3>Claim agent</h3>
+          <pre className="instruction-copy">
+            {instructions.claim_instructions}
+          </pre>
+        </section>
       )}
     </section>
   );

@@ -2,13 +2,9 @@ import { useCallback, useEffect, useState } from "react";
 import {
   getClaim,
   getClaims,
-  getCurrentRun,
   getInstructions,
-  getRun,
   signOffClaim,
   startClaim,
-  startQueueRun,
-  type AgentRun,
   type ClaimDetail,
   type ClaimSummary,
 } from "./api";
@@ -16,7 +12,6 @@ import {
 export type DeskView = "queue" | "instructions";
 
 interface Instructions {
-  queue_instructions: string;
   claim_instructions: string;
 }
 
@@ -62,36 +57,11 @@ function useClaimPolling(
   }, [selectedClaimId, setClaims, setDetail, setError, shouldPollClaim]);
 }
 
-function useRunPolling(
-  run: AgentRun | null,
-  refreshRun: (knownRunId?: string | null) => Promise<AgentRun | null>,
-  setError: (error: string) => void,
-) {
-  useEffect(() => {
-    if (run?.status !== "in progress") return;
-    const timer = window.setInterval(() => {
-      void refreshRun(run.run_id).catch((reason: unknown) => {
-        setError(
-          reason instanceof Error
-            ? reason.message
-            : "Could not refresh the run.",
-        );
-      });
-    }, 1000);
-    return () => {
-      window.clearInterval(timer);
-    };
-  }, [refreshRun, run, setError]);
-}
-
 export function useClaimsDesk() {
   const [claims, setClaims] = useState<ClaimSummary[]>([]);
   const [selectedClaimId, setSelectedClaimId] = useState<string | null>(null);
   const [detail, setDetail] = useState<ClaimDetail | null>(null);
   const [instructions, setInstructions] = useState<Instructions | null>(null);
-  const [run, setRun] = useState<AgentRun | null>(null);
-  const [trackedRunId, setTrackedRunId] = useState<string | null>(null);
-  const [maxClaims, setMaxClaims] = useState(5);
   const [view, setView] = useState<DeskView>("queue");
   const [error, setError] = useState("");
   const [actionBusy, setActionBusy] = useState(false);
@@ -104,42 +74,14 @@ export function useClaimsDesk() {
     setClaims(nextQueue.claims);
   }, []);
 
-  const refreshRun = useCallback(
-    async (knownRunId: string | null = trackedRunId) => {
-      const current = await getCurrentRun();
-      if (current.run !== null) {
-        setRun(current.run);
-        setTrackedRunId(current.run.run_id);
-        const queue = await getClaims();
-        setClaims(queue.claims);
-        return current.run;
-      }
-      if (knownRunId !== null) {
-        const saved = await getRun(knownRunId);
-        setRun(saved);
-        setTrackedRunId(knownRunId);
-        const queue = await getClaims();
-        setClaims(queue.claims);
-        return saved;
-      }
-      setRun(null);
-      return null;
-    },
-    [trackedRunId],
-  );
-
   useEffect(() => {
     let active = true;
-    void Promise.all([getClaims(), getCurrentRun()])
-      .then(([queue, current]) => {
+    void getClaims()
+      .then((queue) => {
         if (!active) return;
         setClaims(queue.claims);
         if (queue.claims.length > 0)
           setSelectedClaimId(queue.claims[0].claim_id);
-        if (current.run !== null) {
-          setRun(current.run);
-          setTrackedRunId(current.run.run_id);
-        }
       })
       .catch((reason: unknown) => {
         if (active) {
@@ -168,7 +110,6 @@ export function useClaimsDesk() {
     setClaims,
     setError,
   );
-  useRunPolling(run, refreshRun, setError);
 
   const runClaimAction = useCallback(
     async (claimId: string, action: () => Promise<unknown>) => {
@@ -195,12 +136,8 @@ export function useClaimsDesk() {
     setActionBusy(true);
     setError("");
     void startClaim(selectedClaimId)
-      .then(async (started) => {
-        setTrackedRunId(started.run_id);
-        await Promise.all([
-          refreshClaim(selectedClaimId),
-          refreshRun(started.run_id),
-        ]);
+      .then(async () => {
+        await refreshClaim(selectedClaimId);
       })
       .catch((reason: unknown) => {
         setError(
@@ -212,32 +149,7 @@ export function useClaimsDesk() {
       .finally(() => {
         setActionBusy(false);
       });
-  }, [refreshClaim, refreshRun, selectedClaimId]);
-
-  const handleQueueRun = useCallback(() => {
-    if (maxClaims < 1 || maxClaims > 25 || run?.status === "in progress")
-      return;
-    setActionBusy(true);
-    setError("");
-    void startQueueRun(maxClaims)
-      .then(async (started) => {
-        setTrackedRunId(started.run_id);
-        const updates: Promise<unknown>[] = [refreshRun(started.run_id)];
-        if (selectedClaimId !== null)
-          updates.push(refreshClaim(selectedClaimId));
-        await Promise.all(updates);
-      })
-      .catch((reason: unknown) => {
-        setError(
-          reason instanceof Error
-            ? reason.message
-            : "Could not start the queue run.",
-        );
-      })
-      .finally(() => {
-        setActionBusy(false);
-      });
-  }, [maxClaims, refreshClaim, refreshRun, run?.status, selectedClaimId]);
+  }, [refreshClaim, selectedClaimId]);
 
   const handleSignOff = useCallback(() => {
     if (selectedClaimId === null) return;
@@ -265,16 +177,12 @@ export function useClaimsDesk() {
     claims,
     detail,
     error,
-    handleQueueRun,
     handleRun,
     handleSignOff,
     instructions,
-    maxClaims,
     openInstructions,
-    run,
     selectedClaimId,
     selectedHandler,
-    setMaxClaims,
     setSelectedHandler,
     setSelectedClaimId,
     setView,

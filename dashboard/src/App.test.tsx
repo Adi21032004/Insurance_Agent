@@ -5,7 +5,7 @@ import {
   approvedDecision,
   jsonResponse,
   makeDetail,
-  makeRun,
+  makeEvaluation,
   makeSummary,
   mockApi,
   requestPath,
@@ -14,6 +14,7 @@ import type { ClaimDetail, Decision } from "./api";
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  window.history.replaceState(null, "", "/");
 });
 
 it("shows the queue and full claim details with INR amounts", async () => {
@@ -39,8 +40,8 @@ it("shows the queue and full claim details with INR amounts", async () => {
 it("shows queue states including handler review", async () => {
   const fetchMock = vi.fn((input: RequestInfo | URL): Promise<Response> => {
     const path = requestPath(input);
-    if (path === "/api/agent/runs/current") {
-      return Promise.resolve(jsonResponse({ run: null }));
+    if (path === "/api/dispatches/latest") {
+      return Promise.resolve(jsonResponse(null));
     }
     if (path === "/api/claims") {
       return Promise.resolve(
@@ -78,7 +79,6 @@ it("starts a claim and shows its progress and decision", async () => {
   expect(
     await screen.findByText("Checking the story and receipts."),
   ).toBeDefined();
-  expect(await screen.findByText("Reviewed one claim.")).toBeDefined();
   expect(fetchMock).toHaveBeenCalledWith(
     "/api/claims/CLM-1001/run",
     expect.objectContaining({ method: "POST" }),
@@ -145,37 +145,28 @@ it("shows the read-only agent instructions", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Agent instructions" }));
 
   expect(
-    await screen.findByText(
-      "Choose the ordered batch and keep its tasks current.",
-    ),
-  ).toBeDefined();
-  expect(
     await screen.findByText("Use the policy wording and claims manual."),
   ).toBeDefined();
+  expect(
+    screen.queryByText("Choose the ordered batch and keep its tasks current."),
+  ).toBeNull();
   expect(screen.queryByRole("textbox")).toBeNull();
 });
 
-it("starts a capped queue run and displays its saved tasks and summary", async () => {
+it("starts a dispatch with three claim agents", async () => {
   const fetchMock = mockApi();
   render(<App />);
 
-  fireEvent.click(await screen.findByRole("button", { name: "Run queue" }));
+  fireEvent.click(
+    await screen.findByRole("button", { name: "Start a dispatch" }),
+  );
 
-  expect(
-    await screen.findByRole("heading", { name: "Run summary" }),
-  ).toBeDefined();
-  expect(
-    await screen.findByText(
-      "Reviewed 5 claims: 3 approved, 1 declined, 1 referred, 0 need handler attention.",
-    ),
-  ).toBeDefined();
-  expect(screen.getByText("CLM-1005")).toBeDefined();
-  expect(screen.getAllByText("done")).toHaveLength(5);
+  expect(await screen.findByText("Dispatch #1")).toBeDefined();
   expect(fetchMock).toHaveBeenCalledWith(
-    "/api/agent/runs",
+    "/api/dispatches",
     expect.objectContaining({
       method: "POST",
-      body: JSON.stringify({ max_claims: 5 }),
+      body: JSON.stringify({ agents: 3 }),
     }),
   );
 });
@@ -204,22 +195,14 @@ it("shows the policy and manual sections read for the selected claim", async () 
   ).toBeDefined();
 });
 
-it("polls task changes and keeps the completed run after current becomes null", async () => {
-  let currentRun = makeRun("in progress", 2);
-  let currentReads = 0;
-  const completedRun = makeRun("completed", 2);
+it("shows the scoreboard and starts an evaluation", async () => {
   const fetchMock = vi.fn((input: RequestInfo | URL): Promise<Response> => {
     const path = requestPath(input);
-    if (path === "/api/agent/runs/current") {
-      currentReads += 1;
-      if (currentReads > 2) {
-        currentRun = completedRun;
-        return Promise.resolve(jsonResponse({ run: null }));
-      }
-      return Promise.resolve(jsonResponse({ run: currentRun }));
+    if (path === "/api/dispatches/latest") {
+      return Promise.resolve(jsonResponse(null));
     }
-    if (path === "/api/agent/runs/RUN-0001") {
-      return Promise.resolve(jsonResponse(currentRun));
+    if (path === "/api/evaluations") {
+      return Promise.resolve(jsonResponse([]));
     }
     if (path === "/api/claims") {
       return Promise.resolve(jsonResponse({ claims: [makeSummary()] }));
@@ -229,23 +212,63 @@ it("polls task changes and keeps the completed run after current becomes null", 
   vi.stubGlobal("fetch", fetchMock);
   render(<App />);
 
+  fireEvent.click(screen.getByRole("button", { name: "Scoreboard" }));
   expect(
-    await screen.findByRole("heading", { name: "Current run" }),
+    await screen.findByRole("heading", { name: "Scoreboard" }),
   ).toBeDefined();
-  expect(
-    await screen.findByRole(
-      "heading",
-      { name: "Run summary" },
-      { timeout: 4000 },
-    ),
-  ).toBeDefined();
-  expect(screen.getAllByText("done")).toHaveLength(2);
+  fireEvent.click(
+    await screen.findByRole("button", { name: "Start an evaluation" }),
+  );
+  expect(fetchMock).toHaveBeenCalledWith(
+    "/api/evaluations",
+    expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({
+        evaluation_set: "evaluation",
+        tiny: false,
+        agents: 3,
+      }),
+    }),
+  );
 });
 
-it("shows a clear error when a queue run cannot start", async () => {
+it("lists evaluation measures and opens a scored evaluation page", async () => {
+  const evaluation = makeEvaluation();
+  const fetchMock = vi.fn((input: RequestInfo | URL): Promise<Response> => {
+    const path = requestPath(input);
+    if (path === "/api/dispatches/latest") {
+      return Promise.resolve(jsonResponse(null));
+    }
+    if (path === "/api/evaluations") {
+      return Promise.resolve(jsonResponse([evaluation]));
+    }
+    if (path === `/api/evaluations/${evaluation.run_id}`) {
+      return Promise.resolve(jsonResponse(evaluation));
+    }
+    if (path === "/api/claims") {
+      return Promise.resolve(jsonResponse({ claims: [makeSummary()] }));
+    }
+    return Promise.resolve(jsonResponse(makeDetail()));
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<App />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Scoreboard" }));
+  expect(await screen.findByText("80%")).toBeDefined();
+  fireEvent.click(await screen.findByRole("button", { name: "#1" }));
+
+  expect(
+    await screen.findByRole("heading", { name: "Held-out set" }),
+  ).toBeDefined();
+  expect(screen.getAllByText("40 s").length).toBeGreaterThan(0);
+  expect(screen.getByText("The evidence supports the claim.")).toBeDefined();
+  expect(screen.getByText("Right")).toBeDefined();
+});
+
+it("shows a clear error when a dispatch cannot start", async () => {
   const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const path = requestPath(input);
-    if (path === "/api/agent/runs" && init?.method === "POST") {
+    if (path === "/api/dispatches" && init?.method === "POST") {
       return Promise.resolve(
         jsonResponse(
           {
@@ -258,8 +281,8 @@ it("shows a clear error when a queue run cannot start", async () => {
         ),
       );
     }
-    if (path === "/api/agent/runs/current") {
-      return Promise.resolve(jsonResponse({ run: null }));
+    if (path === "/api/dispatches/latest") {
+      return Promise.resolve(jsonResponse(null));
     }
     if (path === "/api/claims") {
       return Promise.resolve(jsonResponse({ claims: [makeSummary()] }));
@@ -269,7 +292,9 @@ it("shows a clear error when a queue run cannot start", async () => {
   vi.stubGlobal("fetch", fetchMock);
   render(<App />);
 
-  fireEvent.click(await screen.findByRole("button", { name: "Run queue" }));
+  fireEvent.click(
+    await screen.findByRole("button", { name: "Start a dispatch" }),
+  );
 
   expect(
     await screen.findByText("Another agent run is already active"),
