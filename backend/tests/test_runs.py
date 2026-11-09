@@ -6,11 +6,14 @@ from threading import Barrier
 from typing import Any
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from langchain_core.runnables import RunnableConfig
 from sqlalchemy import JSON, inspect
 from sqlalchemy.pool import NullPool, QueuePool
 
-from backend import database, main
+from agent import dispatcher as swarm_dispatcher
+from backend import database, dependencies, lookups, main, runs, views
 from backend.main import app
 
 
@@ -419,15 +422,10 @@ def test_new_run_recovers_expired_run_before_accepting_queue_work(
     assert len(started_threads) == 1
 
 
-def test_swarm_dispatcher_and_run_routes_cover_new_dispatch_modules(
+def test_swarm_dispatcher_and_helpers_cover_new_modules(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
     monkeypatch.setattr(database, "DATABASE_PATH", tmp_path / "swarm.sqlite3")
-
-    from fastapi import FastAPI
-
-    from agent import dispatcher as swarm_dispatcher
-    from backend import dependencies, lookups, runs, views
 
     def fake_run(run_id: str) -> dict[str, Any] | None:
         if run_id == "dispatch-1":
@@ -438,27 +436,58 @@ def test_swarm_dispatcher_and_run_routes_cover_new_dispatch_modules(
     monkeypatch.setattr(database, "list_waiting_claim_ids", lambda limit: ["CLM-1001"])
     monkeypatch.setattr(database, "finish_run", lambda run_id, summary: None)
 
-    config = {"configurable": {"run": {"run_id": "dispatch-1"}, "claim_id": "CLM-1001", "work": lambda claim_id, run_id: f"{claim_id}:{run_id}"}}
-    assert swarm_dispatcher.list_claims({"claims": [], "reports": []}, {"configurable": {"run": {"run_id": "dispatch-1"}}}) == {"claims": ["CLM-1001"]}
-    assert swarm_dispatcher.finish_run({"reports": ["done"]}, {"configurable": {"run": {"run_id": "dispatch-1"}}}) == {"reports": ["done"]}
-    assert swarm_dispatcher.work_claim({"claims": [], "reports": []}, config) == {"reports": ["CLM-1001:dispatch-1"]}
-    graph = swarm_dispatcher.build_graph(lambda claim_id, run_id: f"{claim_id}:{run_id}")
+    config: RunnableConfig = {
+        "configurable": {
+            "run": {"run_id": "dispatch-1"},
+            "claim_id": "CLM-1001",
+            "work": lambda claim_id, run_id: f"{claim_id}:{run_id}",
+        }
+    }
+    assert swarm_dispatcher.list_claims(
+        {"claims": [], "reports": []},
+        {"configurable": {"run": {"run_id": "dispatch-1"}}},
+    ) == {"claims": ["CLM-1001"]}
+    assert swarm_dispatcher.finish_run(
+        {"claims": [], "reports": ["done"]},
+        {"configurable": {"run": {"run_id": "dispatch-1"}}},
+    ) == {"reports": ["done"]}
+    assert swarm_dispatcher.work_claim({"claims": [], "reports": []}, config) == {
+        "reports": ["CLM-1001:dispatch-1"]
+    }
+    graph = swarm_dispatcher.build_graph(
+        lambda claim_id, run_id: f"{claim_id}:{run_id}"
+    )
     assert hasattr(graph, "work")
-    assert swarm_dispatcher.work_run({"run_id": "dispatch-1"}, lambda claim_id, run_id: f"{claim_id}:{run_id}") == ["CLM-1001:dispatch-1"]
+    assert swarm_dispatcher.work_run(
+        {"run_id": "dispatch-1"}, lambda claim_id, run_id: f"{claim_id}:{run_id}"
+    ) == ["CLM-1001:dispatch-1"]
 
     assert dependencies.get_db() is not None
-    assert views.to_claim({
-        "claim": {"claim_id": "CLM-1001"},
-        "status": "decided",
-        "decision": "approve",
-        "payment": {"amount": 130},
-        "sign_off_handler_id": "HND-01",
-        "sign_off_at": "2024-01-01",
-        "thread_id": "thread-1",
-        "policy": {"policy_id": "POL-1"},
-        "customer": {"customer_id": "CUST-1"},
-    })["claim_id"] == "CLM-1001"
-    assert views.to_summary({"run_id": "run-1", "status": "finished", "summary": "done", "max_claims": 3, "run_type": "dispatch"}) == {
+    assert (
+        views.to_claim(
+            {
+                "claim": {"claim_id": "CLM-1001"},
+                "status": "decided",
+                "decision": "approve",
+                "payment": {"amount": 130},
+                "sign_off_handler_id": "HND-01",
+                "sign_off_at": "2024-01-01",
+                "thread_id": "thread-1",
+                "policy": {"policy_id": "POL-1"},
+                "customer": {"customer_id": "CUST-1"},
+            }
+        )["claim_id"]
+        == "CLM-1001"
+    )
+    assert views.to_summary(
+        {
+            "run_id": "run-1",
+            "status": "finished",
+            "summary": "done",
+            "max_claims": 3,
+            "run_type": "dispatch",
+        }
+    ) == {
         "run_id": "run-1",
         "status": "finished",
         "summary": "done",
@@ -469,34 +498,86 @@ def test_swarm_dispatcher_and_run_routes_cover_new_dispatch_modules(
     assert lookups.claim_not_found_message("CLM-9999") == "Claim CLM-9999 not found"
     assert lookups.run_not_found_message("run-9") == "Run run-9 not found"
 
+
+def test_swarm_run_routes_cover_dispatch_and_evaluation_operations(
+    monkeypatch: pytest.MonkeyPatch,
+):
     api = FastAPI()
     api.include_router(runs.router)
     client = TestClient(api)
 
-    monkeypatch.setattr(runs.agent_service, "start_dispatch", lambda agents: {"agents": agents})
+    monkeypatch.setattr(
+        runs.agent_service, "start_dispatch", lambda agents: {"agents": agents}
+    )
     response = client.post("/api/dispatches", json={"agents": 5})
     assert response.status_code == 202
     assert response.json() == {"status": "accepted", "agents": 5}
 
-    monkeypatch.setattr(runs.agent_service, "start_evaluation", lambda evaluation_set, tiny, agents: {"evaluation_set": evaluation_set, "tiny": tiny, "agents": agents})
-    response = client.post("/api/evaluations", json={"evaluation_set": "held_out", "tiny": True, "agents": 3})
+    monkeypatch.setattr(
+        runs.agent_service,
+        "start_evaluation",
+        lambda evaluation_set, tiny, agents: {
+            "evaluation_set": evaluation_set,
+            "tiny": tiny,
+            "agents": agents,
+        },
+    )
+    response = client.post(
+        "/api/evaluations",
+        json={"evaluation_set": "held_out", "tiny": True, "agents": 3},
+    )
     assert response.status_code == 202
     assert response.json()["evaluation_set"] == "held_out"
 
     monkeypatch.setattr(database, "list_evaluations", lambda: [])
-    monkeypatch.setattr(database, "create_dispatch", lambda run_id, agents, model, reasoning_effort: {"run_id": run_id, "status": "running", "agents": agents, "model": model, "reasoning_effort": reasoning_effort})
-    monkeypatch.setattr(database, "create_evaluation", lambda run_id, evaluation_set, tiny, agents, model, reasoning_effort: {"run_id": run_id, "status": "running", "evaluation_set": evaluation_set, "tiny": tiny, "agents": agents, "model": model, "reasoning_effort": reasoning_effort})
+    monkeypatch.setattr(
+        database,
+        "create_dispatch",
+        lambda run_id, agents, model, reasoning_effort: {
+            "run_id": run_id,
+            "status": "running",
+            "agents": agents,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+        },
+    )
+    monkeypatch.setattr(
+        database,
+        "create_evaluation",
+        lambda run_id, evaluation_set, tiny, agents, model, reasoning_effort: {
+            "run_id": run_id,
+            "status": "running",
+            "evaluation_set": evaluation_set,
+            "tiny": tiny,
+            "agents": agents,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+        },
+    )
     monkeypatch.setattr(database, "record_run_claims", lambda run_id, claim_ids: None)
     monkeypatch.setattr(database, "finish_run_summary", lambda run_id, summary: None)
-    monkeypatch.setattr(database, "get_latest_dispatch", lambda: {"run_id": "dispatch-1", "status": "running", "summary": None})
-    monkeypatch.setattr(database, "list_evaluations", lambda: [{"run_id": "eval-1", "status": "running"}])
+    monkeypatch.setattr(
+        database,
+        "get_latest_dispatch",
+        lambda: {"run_id": "dispatch-1", "status": "running", "summary": None},
+    )
+    monkeypatch.setattr(
+        database,
+        "list_evaluations",
+        lambda: [{"run_id": "eval-1", "status": "running"}],
+    )
     monkeypatch.setattr(database, "get_evaluation", lambda run_id: None)
 
-    response = client.post("/api/runs/dispatches", json={"agents": 2, "model": "openai/gpt-6-luna", "reasoning_effort": "low"})
+    response = client.post(
+        "/api/runs/dispatches",
+        json={"agents": 2, "model": "openai/gpt-6-luna", "reasoning_effort": "low"},
+    )
     assert response.status_code == 200
     run_id = response.json()["run_id"]
 
-    response = client.put(f"/api/runs/{run_id}/claims", json={"claim_ids": ["CLM-1001", "CLM-1002"]})
+    response = client.put(
+        f"/api/runs/{run_id}/claims", json={"claim_ids": ["CLM-1001", "CLM-1002"]}
+    )
     assert response.status_code == 200
     assert response.json()["claim_ids"] == ["CLM-1001", "CLM-1002"]
 
