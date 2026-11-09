@@ -404,8 +404,9 @@ def engine() -> Engine:
             ).replace("postgresql://", "postgresql+psycopg://", 1)
             _ENGINES[key] = create_engine(
                 url,
-                pool_size=4,
-                max_overflow=0,
+                pool_size=10,
+                max_overflow=15,
+                pool_timeout=30,
                 pool_pre_ping=True,
                 connect_args=POSTGRES_CONNECT_ARGS,
             )
