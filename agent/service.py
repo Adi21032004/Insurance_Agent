@@ -15,6 +15,7 @@ from agent.harness import (
     carry_on,
     checkpoint_pool,
     claim_graphs,
+    work_claim,
     work_in_run,
 )
 
@@ -54,6 +55,18 @@ def resume_in_background(claim_id: str, pool: Any) -> None:
         logger.exception("Could not resume signed-off claim %s", claim_id)
     finally:
         app.state.resuming.discard(claim_id)
+
+
+def claim_in_background(claim_id: str, pool: Any) -> None:
+    """Run one directly started claim without holding the HTTP response."""
+    try:
+        record = api.get_agent_claim(claim_id)
+        graph = claim_graphs(pool)(claim_id)
+        logger.info(work_claim(claim_id, graph, record["thread_id"]))
+    except Exception:
+        logger.exception("Could not work claim %s", claim_id)
+    finally:
+        app.state.run_lock.release()
 
 
 def dispatch_in_background(agents: int, pool: Any) -> None:
@@ -199,4 +212,21 @@ def resume_claim(claim_id: str, background_tasks: BackgroundTasks) -> dict[str, 
         raise HTTPException(status_code=409, detail="Claim is not in progress")
     app.state.resuming.add(claim_id)
     background_tasks.add_task(resume_in_background, claim_id, app.state.checkpoint_pool)
+    return {"claim_id": claim_id, "status": "accepted"}
+
+
+@app.post("/api/claims/{claim_id}/run", status_code=202, operation_id="start_claim")
+def start_claim(claim_id: str, background_tasks: BackgroundTasks) -> dict[str, str]:
+    """Accept one claim after the backend has reserved it."""
+    try:
+        record = api.get_agent_claim(claim_id)
+    except Exception as error:
+        raise HTTPException(status_code=404, detail="Claim not found") from error
+    if record["status"] != "in progress" or record["decision"] is not None:
+        raise HTTPException(status_code=409, detail="Claim is not ready to start")
+    if not app.state.run_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409, detail="A dispatch or an evaluation is already running"
+        )
+    background_tasks.add_task(claim_in_background, claim_id, app.state.checkpoint_pool)
     return {"claim_id": claim_id, "status": "accepted"}

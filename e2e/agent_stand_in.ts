@@ -48,13 +48,13 @@ const server = createServer((incoming, outgoing) => {
     outgoing.end(JSON.stringify({ status: "accepted" }));
     return;
   }
-  const run = /^\/api\/runs\/([^/]+)\/run$/.exec(url.pathname);
-  if (incoming.method === "POST" && run !== null) {
+  const claimRun = /^\/api\/claims\/([^/]+)\/run$/.exec(url.pathname);
+  if (incoming.method === "POST" && claimRun !== null) {
     const upstream = httpRequest(
       {
         hostname: "127.0.0.1",
         port: upstreamPort,
-        path: `/api/runs/${encodeURIComponent(run[1])}/run`,
+        path: `/api/claims/${encodeURIComponent(claimRun[1])}/run`,
         method: "POST",
         headers: incoming.headers,
       },

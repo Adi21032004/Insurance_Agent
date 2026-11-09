@@ -590,20 +590,27 @@ def get_policy_wording() -> dict[str, str]:
 
 
 @app.post("/api/claims/{claim_id}/run", operation_id="start_claim")
-def start_claim(claim_id: str, background_tasks: BackgroundTasks) -> dict[str, str]:
+def start_claim(claim_id: str) -> dict[str, str]:
     """Start the agent review for a waiting claim."""
-    dispatch_recovered_runs()
-    if database.get_current_run() is not None:
-        raise active_run_conflict()
     record = claim_or_404(claim_id)
     if record["status"] != "waiting":
         raise HTTPException(status_code=409, detail="Claim is not waiting")
     try:
-        run_id = create_run_for_claim(claim_id)
+        database.start_direct_claim(claim_id)
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
-    background_tasks.add_task(process_queue_run, run_id)
-    return {"status": "in progress", "run_id": run_id}
+    try:
+        agent_service.start_claim(claim_id)
+    except agent_service.AgentServiceConflict as error:
+        database.set_claim_status(claim_id, "waiting")
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except RuntimeError as error:
+        database.set_claim_status(claim_id, "waiting")
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    database.add_event(
+        claim_id, "Review started", "Checking the story, policy and documents."
+    )
+    return {"status": "in progress"}
 
 
 @app.post("/api/claims/{claim_id}/run/direct", operation_id="start_direct_claim_run")

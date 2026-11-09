@@ -1,5 +1,3 @@
-from typing import Any
-
 import pytest
 from fastapi.testclient import TestClient
 
@@ -9,38 +7,17 @@ from backend import database, main
 def test_start_claim_marks_in_progress_before_background_work(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ):
-    captured: list[tuple[str, str, str]] = []
-
-    def finish_claim(run_id: str, thread_id: str) -> str:
-        run = database.get_run(run_id)
-        assert run is not None
-        assert len(run["todos"]) == 1
-        claim_id = run["todos"][0]["claim_id"]
-        captured.append((claim_id, run_id, thread_id))
-        decision: dict[str, Any] = {
-            "outcome": "refer",
-            "reason": "The evidence is incomplete. A handler should review the claim.",
-            "policy_section": "Section 11: How to Claim",
-            "calculation": [],
-            "payout_inr": 0.0,
-            "needs_sign_off": False,
-        }
-        database.save_decision(claim_id, decision, "decided")
-        database.set_todo_status(run["todos"][0]["todo_id"], "done")
-        database.finish_run(run_id, "Reviewed one claim.")
-        return "Referred for review."
-
-    monkeypatch.setattr(main, "run_queue_agent", finish_claim)
+    started: list[str] = []
+    monkeypatch.setattr(main.agent_service, "start_claim", started.append)
     response = client.post("/api/claims/CLM-1001/run")
 
     assert response.status_code == 200
     assert response.json()["status"] == "in progress"
-    assert response.json()["run_id"] == captured[0][1]
-    assert captured[0][0] == "CLM-1001"
-    assert captured[0][2].startswith(captured[0][1])
+    assert started == ["CLM-1001"]
+    assert database.get_latest_run() is None
     claim = client.get("/api/claims/CLM-1001").json()
-    assert claim["status"] == "decided"
-    assert claim["decision"]["outcome"] == "refer"
+    assert claim["status"] == "in progress"
+    assert claim["decision"] is None
     assert claim["progress"][0]["step"] == "Review started"
 
 
@@ -53,37 +30,34 @@ def test_start_claim_rejects_non_waiting_claim(client: TestClient):
     assert response.json()["detail"] == "Claim is not waiting"
 
 
-def test_worker_stopping_before_persisting_failure_keeps_claim_recoverable(
+def test_unavailable_agent_service_restores_claim_to_waiting(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ):
-    def fail_run(run_id: str, thread_id: str) -> str:
-        raise RuntimeError("No model provider available")
+    def fail_start(claim_id: str):
+        raise RuntimeError("The agent's service isn't running")
 
-    monkeypatch.setattr(main, "run_queue_agent", fail_run)
+    monkeypatch.setattr(main.agent_service, "start_claim", fail_start)
     response = client.post("/api/claims/CLM-1001/run")
 
-    assert response.status_code == 200
+    assert response.status_code == 503
     claim = client.get("/api/claims/CLM-1001").json()
-    assert claim["status"] == "in progress"
+    assert claim["status"] == "waiting"
     assert claim["failure_count"] == 0
     assert claim["decision"] is None
 
 
-def test_worker_stopping_without_a_decision_keeps_claim_recoverable(
+def test_agent_service_conflict_restores_claim_to_waiting(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ):
-    def no_decision(run_id: str, thread_id: str) -> str:
-        raise RuntimeError("No decision.")
+    def reject_start(claim_id: str):
+        raise main.agent_service.AgentServiceConflict("A dispatch is already running")
 
-    monkeypatch.setattr(main, "run_queue_agent", no_decision)
-
+    monkeypatch.setattr(main.agent_service, "start_claim", reject_start)
     response = client.post("/api/claims/CLM-1001/run")
 
-    assert response.status_code == 200
+    assert response.status_code == 409
     claim = client.get("/api/claims/CLM-1001").json()
-    assert claim["status"] == "in progress"
-    assert claim["failure_count"] == 0
-    assert claim["decision"] is None
+    assert claim["status"] == "waiting"
 
 
 def test_decision_and_payment_api_replays_are_idempotent(client: TestClient):

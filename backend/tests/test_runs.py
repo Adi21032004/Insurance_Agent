@@ -883,22 +883,6 @@ def test_decision_signoff_and_payment_writes_are_idempotent(client: TestClient):
     assert payment_row[0] == 1
 
 
-def test_named_claim_creates_a_one_item_run(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-):
-    monkeypatch.setattr(main, "process_queue_run", lambda run_id: None)
-
-    response = client.post("/api/claims/CLM-1001/run")
-    run = client.get("/api/agent/runs/current").json()["run"]
-
-    assert response.json()["status"] == "in progress"
-    assert response.json()["run_id"] == run["run_id"]
-    assert run["run_type"] == "claim"
-    assert run["max_claims"] == 1
-    assert [item["claim_id"] for item in run["todos"]] == ["CLM-1001"]
-    assert run["todos"][0]["status"] == "to do"
-
-
 def test_direct_claim_run_starts_without_creating_a_run(client: TestClient):
     response = client.post("/api/claims/CLM-1001/run/direct")
     claim = client.get("/api/claims/CLM-1001").json()

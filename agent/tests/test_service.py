@@ -52,6 +52,33 @@ def test_service_resume_rejects_missing_and_non_active_claims(
     assert conflict.status_code == 409
 
 
+def test_service_starts_a_reserved_claim_in_the_background(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    started: list[tuple[str, Any]] = []
+    monkeypatch.setattr(
+        service.api,
+        "get_agent_claim",
+        lambda claim_id: {
+            "status": "in progress",
+            "decision": None,
+            "thread_id": None,
+        },
+    )
+
+    def start(claim_id: str, pool: Any):
+        started.append((claim_id, pool))
+        service.app.state.run_lock.release()
+
+    monkeypatch.setattr(service, "claim_in_background", start)
+
+    response = client.post("/api/claims/CLM-1001/run")
+
+    assert response.status_code == 202
+    assert response.json() == {"claim_id": "CLM-1001", "status": "accepted"}
+    assert started == [("CLM-1001", service.app.state.checkpoint_pool)]
+
+
 def test_resume_background_uses_a_claim_graph_and_logs_completion(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,

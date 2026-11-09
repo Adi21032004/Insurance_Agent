@@ -42,6 +42,19 @@ def resume_claim(claim_id: str) -> None:
         logger.warning("Could not resume signed-off claim %s: %s", claim_id, error)
 
 
+def start_claim(claim_id: str) -> None:
+    """Ask the agent service to start one claim without a run record."""
+    try:
+        post_agent(f"/api/claims/{claim_id}/run")
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code == httpx.codes.CONFLICT:
+            detail = error.response.json().get("detail", "A run is already active")
+            raise AgentServiceConflict(str(detail)) from error
+        raise RuntimeError("The agent's service isn't running") from error
+    except httpx.HTTPError as error:
+        raise RuntimeError("The agent's service isn't running") from error
+
+
 def start_dispatch(agents: int) -> dict[str, Any]:
     """Ask the agent service to start a dispatch with N claim agents at once."""
     try:
