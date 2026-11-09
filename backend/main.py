@@ -97,6 +97,8 @@ def claim_payload(record: dict[str, Any]) -> dict[str, Any]:
         payment["signed_off_at"] = record["sign_off_at"]
     return {
         "claim": claim,
+        "evaluation_id": record["evaluation_id"],
+        "copy_of": record["copy_of"],
         "policy": policy,
         "customer": converted_customer(record["customer"], rate),
         "plan": plan,
@@ -763,6 +765,13 @@ def sign_off_claim(
 ) -> dict[str, str]:
     """Record a handler's sign-off on an over-limit claim."""
     record = claim_or_404(claim_id)
+    if record["evaluation_id"] is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Claim {claim_id} is a copy in an evaluation and can't be signed off"
+            ),
+        )
     if record["decision"] is None or record["decision"]["outcome"] != "approve":
         raise HTTPException(
             status_code=409, detail="Only approved claims can be signed off"

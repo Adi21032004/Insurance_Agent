@@ -10,12 +10,14 @@ def test_seed_reports_local_and_postgres_destinations(monkeypatch, capsys):
     }
     monkeypatch.setattr(database, "reseed_database", lambda: None)
     monkeypatch.setattr(database, "read_json", counts.__getitem__)
+    monkeypatch.setattr(database, "evaluation_seed_counts", lambda: (25, 50))
     monkeypatch.delenv("DATABASE_URL", raising=False)
 
     seed.main()
 
     assert capsys.readouterr().out.strip() == (
-        "Seeded 2 claims, 1 policies, 3 customers and 1 handlers into undercover.db"
+        "Seeded 2 claims, 1 policies, 3 customers and 1 handlers into undercover.db, "
+        "with 25 held-out claims and 50 handlers' decisions for evaluations"
     )
 
     monkeypatch.setenv("DATABASE_URL", "postgresql://example.invalid/db")
@@ -23,5 +25,6 @@ def test_seed_reports_local_and_postgres_destinations(monkeypatch, capsys):
 
     assert capsys.readouterr().out.strip() == (
         "Seeded 2 claims, 1 policies, 3 customers and 1 handlers into "
-        "the undercover schema on Postgres"
+        "the undercover schema on Postgres, with 25 held-out claims and 50 handlers' "
+        "decisions for evaluations"
     )

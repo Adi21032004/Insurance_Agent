@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from backend import agent_service, database
+from backend import agent_service, database, scoring
 
-MAX_AGENTS = 25
 router = APIRouter()
 
 
@@ -23,9 +22,15 @@ class DispatchCreateInput(BaseModel):
 
 
 class EvaluationStartInput(BaseModel):
-    evaluation_set: str = Field(min_length=1)
+    evaluation_set: Literal["evaluation", "held_out"]
     tiny: bool
     agents: int = Field(ge=1, le=25)
+
+
+class EvaluationCreateInput(EvaluationStartInput):
+    run_id: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    reasoning_effort: str = Field(min_length=1)
 
 
 class RunClaimInput(BaseModel):
@@ -77,7 +82,7 @@ def get_latest_dispatch() -> dict[str, Any] | None:
 @router.get("/api/evaluations", operation_id="list_evaluations")
 def list_evaluations() -> list[dict[str, Any]]:
     """Return evaluations newest first."""
-    return database.list_evaluations()
+    return [scoring.score_evaluation(run) for run in database.list_evaluations()]
 
 
 @router.get("/api/evaluations/{run_id}", operation_id="get_evaluation")
@@ -86,7 +91,7 @@ def get_evaluation(run_id: str) -> dict[str, Any]:
     evaluation = database.get_evaluation(run_id)
     if evaluation is None:
         raise HTTPException(status_code=404, detail="Evaluation not found")
-    return evaluation
+    return scoring.score_evaluation(evaluation)
 
 
 @router.post("/api/runs/dispatches", operation_id="create_dispatch")
@@ -101,19 +106,19 @@ def create_dispatch(body: DispatchCreateInput) -> dict[str, Any]:
 
 
 @router.post("/api/runs/evaluations", operation_id="create_evaluation")
-def create_evaluation(body: EvaluationStartInput) -> dict[str, Any]:
+def create_evaluation(body: EvaluationCreateInput) -> dict[str, Any]:
     """Persist an evaluation record and return it."""
-    if not 1 <= body.agents <= MAX_AGENTS:
-        raise HTTPException(status_code=422, detail="Evaluation agents must be 1-25")
-    run_id = f"eval-{len(database.list_evaluations()) + 1}"
-    return database.create_evaluation(
-        run_id,
-        body.evaluation_set,
-        body.tiny,
-        body.agents,
-        "openai/gpt-6-luna",
-        "low",
-    )
+    try:
+        return database.create_evaluation(
+            body.run_id,
+            body.evaluation_set,
+            body.tiny,
+            body.agents,
+            body.model,
+            body.reasoning_effort,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 @router.put("/api/runs/{run_id}/claims", operation_id="record_run_claims")

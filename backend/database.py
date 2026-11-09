@@ -41,6 +41,7 @@ DATABASE_PATH = Path(
 )
 RecordTable = Literal["decisions", "payments", "signoffs"]
 MAX_CLAIM_FAILURES = 2
+MAX_AGENTS = 25
 POSTGRES_CONNECT_ARGS = {"options": "-c search_path=undercover"}
 RECORD_SQL = {
     "decisions": {
@@ -111,6 +112,8 @@ claims_table = Table(
     Column("thread_id", String),
     Column("failure_count", Integer, nullable=False, server_default="0"),
     Column("lease_at", String),
+    Column("evaluation_id", String),
+    Column("copy_of", String),
 )
 steps_table = Table(
     "steps",
@@ -619,6 +622,8 @@ def ensure_workflow_columns(db: CoreConnection) -> None:
         ("run_id", "TEXT"),
         ("thread_id", "TEXT"),
         ("lease_at", "TEXT"),
+        ("evaluation_id", "TEXT"),
+        ("copy_of", "TEXT"),
     ):
         if name not in columns:
             db.execute(f"ALTER TABLE claims ADD COLUMN {name} {declaration}")
@@ -683,6 +688,7 @@ def initialize_database() -> None:
         )
         migrate_events_to_steps(db)
         seed_claims(db, claims, policies, customers)
+        seed_evaluation_data(db)
         merge_settings(db, settings)
         save_documents(db, documents)
         db.execute(
@@ -763,6 +769,53 @@ def seed_claims(
         )
 
 
+def seed_evaluation_data(db: CoreConnection) -> None:
+    """Keep held-out records and answer keys out of the claims queue."""
+    for record in read_json("evals/held_out_claims.json"):
+        values = {"claim_id": record["claim_id"], "record": json.dumps(record)}
+        existing = db.execute(
+            select(held_out_claims_table.c.claim_id).where(
+                held_out_claims_table.c.claim_id == record["claim_id"]
+            )
+        ).fetchone()
+        if existing is None:
+            db.execute(held_out_claims_table.insert().values(**values))
+        else:
+            db.execute(
+                held_out_claims_table.update()
+                .where(held_out_claims_table.c.claim_id == record["claim_id"])
+                .values(record=values["record"])
+            )
+    for evaluation_set, filename in (
+        ("evaluation", "evals/decisions.json"),
+        ("held_out", "evals/held_out_decisions.json"),
+    ):
+        for record in read_json(filename):
+            values = {
+                "evaluation_set": evaluation_set,
+                "claim_id": record["claim_id"],
+                "decision": record["decision"],
+                "payout": record["payout"],
+                "tiny": int(record["tiny"]),
+            }
+            existing = db.execute(
+                select(handler_decisions_table.c.decision_id).where(
+                    handler_decisions_table.c.evaluation_set == evaluation_set,
+                    handler_decisions_table.c.claim_id == record["claim_id"],
+                )
+            ).fetchone()
+            if existing is None:
+                db.execute(handler_decisions_table.insert().values(**values))
+            else:
+                db.execute(
+                    handler_decisions_table.update()
+                    .where(
+                        handler_decisions_table.c.decision_id == existing["decision_id"]
+                    )
+                    .values(**values)
+                )
+
+
 def merge_settings(db: CoreConnection, settings: dict[str, Any]) -> None:
     """Insert defaults and merge new keys into existing settings."""
     for name, defaults in settings.items():
@@ -831,6 +884,11 @@ def reseed_database() -> None:
             "steps",
             "source_reads",
             "todos",
+            "run_claims",
+            "model_calls",
+            "work_times",
+            "handler_decisions",
+            "held_out_claims",
             "payments",
             "decisions",
             "signoffs",
@@ -846,10 +904,24 @@ def reseed_database() -> None:
     initialize_database()
 
 
+def evaluation_seed_counts() -> tuple[int, int]:
+    """Return the number of held-out claims and seeded handler decisions."""
+    with connection() as db:
+        held_out = db.execute("SELECT COUNT(*) FROM held_out_claims").fetchone()
+        decisions = db.execute("SELECT COUNT(*) FROM handler_decisions").fetchone()
+    if held_out is None or decisions is None:
+        raise RuntimeError("Could not count evaluation seed records")
+    return int(held_out[0]), int(decisions[0])
+
+
 def list_claim_records() -> list[dict[str, Any]]:
     """Return source claim records with their current workflow state."""
     with connection() as db:
-        rows = db.execute(claim_view.order_by(claims_table.c.claim_id)).fetchall()
+        rows = db.execute(
+            claim_view.where(claims_table.c.evaluation_id.is_(None)).order_by(
+                claims_table.c.claim_id
+            )
+        ).fetchall()
     records = [claim_record(row) for row in rows]
     return sorted(
         records,
@@ -883,6 +955,8 @@ def claim_record(row: RowView) -> dict[str, Any]:
         "run_id": row["run_id"],
         "thread_id": row["thread_id"],
         "failure_count": row["failure_count"],
+        "evaluation_id": row["evaluation_id"],
+        "copy_of": row["copy_of"],
     }
 
 
@@ -1268,8 +1342,17 @@ def get_run(run_id: str) -> dict[str, Any] | None:
             claim_records.append(
                 {
                     "claim_id": item["claim_id"],
+                    "copy_of": record["copy_of"],
+                    "evaluation_id": record["evaluation_id"],
+                    "customer_name": record["customer"]["name"],
+                    "summary": record["claim"]["summary"],
                     "status": record["status"],
                     "decision": record["decision"],
+                    "reason": (
+                        record["decision"].get("reason")
+                        if record["decision"] is not None
+                        else None
+                    ),
                     "payout_inr": (
                         record["decision"]["payout_inr"]
                         if record["decision"] is not None
@@ -1352,7 +1435,11 @@ def create_evaluation(  # noqa: PLR0913, PLR0917
     model: str,
     reasoning_effort: str,
 ) -> dict[str, Any]:
-    """Create a persisted evaluation run and return its summary."""
+    """Create an evaluation and isolated claim copies from a seeded answer set."""
+    if evaluation_set not in {"evaluation", "held_out"}:
+        raise ValueError(f"Unknown evaluation set: {evaluation_set}")
+    if not 1 <= agents <= MAX_AGENTS:
+        raise ValueError("Evaluation agents must be 1-25")
     create_run(run_id, "evaluation", agents)
     with connection() as db:
         db.execute(
@@ -1360,6 +1447,79 @@ def create_evaluation(  # noqa: PLR0913, PLR0917
             "tiny = ?, model = ?, reasoning_effort = ? WHERE run_id = ?",
             (evaluation_set, _bool_to_int(tiny), model, reasoning_effort, run_id),
         )
+        run = db.execute(
+            "SELECT run_order FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if run is None:
+            raise RuntimeError(f"Evaluation {run_id} was not created")
+        labels = db.execute(
+            "SELECT claim_id FROM handler_decisions "
+            "WHERE evaluation_set = ? AND (? = 0 OR tiny = 1) "
+            "ORDER BY claim_id",
+            (evaluation_set, int(tiny)),
+        ).fetchall()
+        if not labels:
+            raise ValueError(f"No seeded claims for evaluation set {evaluation_set}")
+        for position, label in enumerate(labels):
+            original_id = label["claim_id"]
+            if evaluation_set == "held_out":
+                source_row = db.execute(
+                    "SELECT record FROM held_out_claims WHERE claim_id = ?",
+                    (original_id,),
+                ).fetchone()
+                if source_row is None:
+                    raise RuntimeError(f"Held-out claim {original_id} is missing")
+                source = json.loads(source_row["record"])
+                policy_row = db.execute(
+                    select(policies_table.c.policy_json).where(
+                        policies_table.c.policy_id == source["policy_id"]
+                    )
+                ).fetchone()
+                customer_row = db.execute(
+                    select(customers_table.c.customer_json).where(
+                        customers_table.c.customer_id == source["customer_id"]
+                    )
+                ).fetchone()
+                if policy_row is None or customer_row is None:
+                    raise RuntimeError(
+                        f"Reference data for held-out claim {original_id} is missing"
+                    )
+                policy = decode_json(policy_row["policy_json"])
+                customer = decode_json(customer_row["customer_json"])
+            else:
+                original = db.execute(
+                    select(
+                        claims_table.c.source_json,
+                        claims_table.c.policy_json,
+                        claims_table.c.customer_json,
+                    ).where(claims_table.c.claim_id == original_id)
+                ).fetchone()
+                if original is None:
+                    raise RuntimeError(f"Evaluation claim {original_id} is missing")
+                source = json.loads(original["source_json"])
+                policy = json.loads(original["policy_json"])
+                customer = json.loads(original["customer_json"])
+            copy_id = f"{original_id}-E{run['run_order']}"
+            copy_source = {**source, "claim_id": copy_id}
+            db.execute(
+                claims_table.insert().values(
+                    claim_id=copy_id,
+                    policy_id=source["policy_id"],
+                    customer_id=source["customer_id"],
+                    source_json=json.dumps(copy_source),
+                    policy_json=json.dumps(policy),
+                    customer_json=json.dumps(customer),
+                    evaluation_id=run_id,
+                    copy_of=original_id,
+                )
+            )
+            db.execute(
+                run_claims_table.insert().values(
+                    run_id=run_id,
+                    claim_id=copy_id,
+                    position=position,
+                )
+            )
     return get_run(run_id) or {}
 
 
@@ -1469,16 +1629,25 @@ def list_evaluations() -> list[dict[str, Any]]:
             "SELECT run_id FROM runs WHERE run_type = 'evaluation' "
             "OR kind = 'evaluation' ORDER BY run_order DESC"
         ).fetchall()
-    return [get_run(row["run_id"]) or {} for row in rows]
+    return [get_evaluation(row["run_id"]) or {} for row in rows]
 
 
 def get_evaluation(run_id: str) -> dict[str, Any] | None:
-    """Return one evaluation if present."""
+    """Return an evaluation with handler decisions attached to its copies."""
     run = get_run(run_id)
     if run is None:
         return None
     if run.get("run_type") != "evaluation" and run.get("kind") != "evaluation":
         return None
+    with connection() as db:
+        for item in run["claims"]:
+            label = db.execute(
+                "SELECT decision, payout FROM handler_decisions WHERE claim_id = ?",
+                (item.get("copy_of"),),
+            ).fetchone()
+            if label is not None:
+                item["handler_decision"] = label["decision"]
+                item["handler_payout"] = label["payout"]
     return run
 
 

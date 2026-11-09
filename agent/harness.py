@@ -13,6 +13,7 @@ from uuid import uuid4
 
 import psycopg
 from langchain.agents import create_agent
+from langchain_core.exceptions import ModelRateLimitError, ModelTimeoutError
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
@@ -35,6 +36,7 @@ from backend.schemas import RunTodoItemInput
 
 logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "openai/gpt-6-luna"
+TRANSIENT = (ModelRateLimitError, ModelTimeoutError)
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 CLAIM_TIMEOUT_SECONDS = float(os.getenv("UNDERCOVER_CLAIM_TIMEOUT_SECONDS", "120"))
 MAX_MODEL_CALLS = 30
@@ -392,9 +394,21 @@ def work_in_run(claim_id: str, run_id: str, new_graph: Callable[[], Any]) -> str
     """Start or resume one claim using its own graph and the dispatch id."""
     record = api.get_agent_claim(claim_id)
     graph = new_graph()
-    if record["decision"] is not None:
-        return carry_on(claim_id, graph, run_id)
-    return work_claim(claim_id, graph, record["thread_id"], run_id)
+    if record["status"] == "in progress" and record["thread_id"] is not None:
+        report = carry_on(claim_id, graph, run_id)
+    else:
+        report = work_claim(claim_id, graph, record["thread_id"], run_id)
+    latest = api.get_agent_claim(claim_id)
+    if (
+        latest.get("evaluation_id") is not None
+        and latest["status"] == "waiting for sign-off"
+    ):
+        thread_id = _thread_id(claim_id, latest)
+        saver = getattr(graph, "checkpointer", None)
+        if saver is None or not hasattr(saver, "delete_thread"):
+            raise RuntimeError("The evaluation claim checkpoint cannot be cleared")
+        saver.delete_thread(thread_id)
+    return report
 
 
 @tool

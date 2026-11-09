@@ -3,7 +3,9 @@ import json
 from backend import database
 
 
-def test_initialize_database_seeds_only_the_queue(monkeypatch, tmp_path):
+def test_initialize_database_seeds_the_queue_and_isolated_evaluation_data(
+    monkeypatch, tmp_path
+):
     path = tmp_path / "claims.sqlite3"
     monkeypatch.setattr(database, "DATABASE_PATH", path)
 
@@ -15,6 +17,7 @@ def test_initialize_database_seeds_only_the_queue(monkeypatch, tmp_path):
     assert records[0]["claim"]["amount_claimed"] == 420.0
     assert records[0]["decision"] is None
     assert path.exists()
+    assert database.evaluation_seed_counts() == (25, 50)
 
 
 def test_initialize_database_does_not_duplicate_queue(monkeypatch, tmp_path):
@@ -47,7 +50,9 @@ def test_database_seed_sources_are_explicit():
     source = (database.ROOT / "backend" / "database.py").read_text(encoding="utf-8")
     assert 'read_json("claims.json")' in source
     assert 'read_json("policies.json")' in source
-    assert "evals" not in source
+    assert 'read_json("evals/held_out_claims.json")' in source
+    assert '("evaluation", "evals/decisions.json")' in source
+    assert '("held_out", "evals/held_out_decisions.json")' in source
 
 
 def test_source_claims_remain_available_in_sqlite(monkeypatch, tmp_path):

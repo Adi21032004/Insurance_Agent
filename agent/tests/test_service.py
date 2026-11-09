@@ -161,6 +161,55 @@ def test_dispatch_start_rejects_an_active_run(client: TestClient):
     assert response.json()["detail"] == "A dispatch or an evaluation is already running"
 
 
+def test_evaluation_start_creates_copies_and_runs_the_dispatcher(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    created: list[tuple[Any, ...]] = []
+    dispatched: list[dict[str, Any]] = []
+
+    def create_evaluation(  # noqa: PLR0913, PLR0917
+        run_id: str,
+        evaluation_set: str,
+        tiny: bool,
+        agents: int,
+        model_name: str,
+        reasoning_effort: str,
+    ) -> dict[str, Any]:
+        created.append(
+            (run_id, evaluation_set, tiny, agents, model_name, reasoning_effort)
+        )
+        return {"run_id": run_id, "claim_ids": ["CLM-1104-E1"]}
+
+    monkeypatch.setattr(service.api, "create_evaluation", create_evaluation)
+    monkeypatch.setattr(
+        service.dispatcher,
+        "work_run",
+        lambda run, work: dispatched.append(run) or [],
+    )
+
+    response = client.post(
+        "/api/evaluations",
+        json={"evaluation_set": "held_out", "tiny": True, "agents": 5},
+    )
+
+    assert response.status_code == 202
+    assert response.json() == {
+        "status": "accepted",
+        "evaluation_set": "held_out",
+        "tiny": True,
+        "agents": 5,
+    }
+    assert created[0][1:] == (
+        "held_out",
+        True,
+        5,
+        "openai/gpt-6-luna",
+        "low",
+    )
+    assert dispatched[0]["claim_ids"] == ["CLM-1104-E1"]
+    assert not service.app.state.run_lock.locked()
+
+
 def test_background_service_logs_failures(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ):

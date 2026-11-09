@@ -193,6 +193,105 @@ def test_dispatch_finish_builds_summary_and_cost_time_totals_from_records(
     assert run["claims"][0]["seconds"] == pytest.approx(0.75)
 
 
+def test_evaluation_copies_seeded_claims_without_changing_the_queue(
+    client: TestClient,
+):
+    assert database.evaluation_seed_counts() == (25, 50)
+    queue_before = [
+        claim["claim_id"] for claim in client.get("/api/claims").json()["claims"]
+    ]
+    response = client.post(
+        "/api/runs/evaluations",
+        json={
+            "run_id": "evaluation-copies",
+            "evaluation_set": "held_out",
+            "tiny": True,
+            "agents": 5,
+            "model": "openai/gpt-6-luna",
+            "reasoning_effort": "low",
+        },
+    )
+    assert response.status_code == 200
+    run_id = response.json()["run_id"]
+    evaluation = database.get_evaluation(run_id)
+    queue_after = [
+        claim["claim_id"] for claim in client.get("/api/claims").json()["claims"]
+    ]
+
+    assert evaluation is not None
+    assert queue_after == queue_before
+    assert [claim["claim_id"] for claim in evaluation["claims"]] == [
+        "CLM-1104-E1",
+        "CLM-1106-E1",
+        "CLM-1110-E1",
+        "CLM-1112-E1",
+        "CLM-1114-E1",
+    ]
+    assert all(claim["evaluation_id"] == run_id for claim in evaluation["claims"])
+    assert all(claim["handler_decision"] for claim in evaluation["claims"])
+    copy = database.get_claim_record("CLM-1104-E1")
+    assert copy is not None
+    assert copy["copy_of"] == "CLM-1104"
+    assert "handler_decision" not in copy
+    assert "reason" not in copy
+    assert "CLM-1104-E1" not in queue_after
+    copy_detail = client.get("/api/claims/CLM-1104-E1").json()
+    agent_copy = client.get("/api/agent/claims/CLM-1104-E1").json()
+    assert copy_detail["evaluation_id"] == run_id
+    assert copy_detail["copy_of"] == "CLM-1104"
+    assert "handler_decision" not in agent_copy
+
+
+def test_evaluation_copy_cannot_be_signed_off(client: TestClient):
+    database.create_evaluation(
+        "evaluation-signoff",
+        "held_out",
+        True,
+        5,
+        "model",
+        "low",
+    )
+    database.set_claim_status("CLM-1104-E1", "in progress")
+    database.save_decision(
+        "CLM-1104-E1",
+        {
+            "outcome": "approve",
+            "reason": "Needs handler approval.",
+            "policy_section": "Section 3",
+            "calculation": [],
+            "payout_inr": 100000.0,
+            "needs_sign_off": True,
+        },
+        "waiting for sign-off",
+    )
+
+    response = client.post(
+        "/api/claims/CLM-1104-E1/sign-off",
+        json={"handler_id": "HND-01"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Claim CLM-1104-E1 is a copy in an evaluation and can't be signed off"
+    )
+
+
+def test_unknown_evaluation_set_is_rejected(client: TestClient):
+    response = client.post(
+        "/api/runs/evaluations",
+        json={
+            "run_id": "invalid-evaluation",
+            "evaluation_set": "unknown",
+            "tiny": True,
+            "agents": 3,
+            "model": "model",
+            "reasoning_effort": "low",
+        },
+    )
+
+    assert response.status_code == 422
+
+
 def test_only_one_run_can_be_active_and_conflict_returns_run_id(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ):
@@ -621,7 +720,23 @@ def test_swarm_run_routes_cover_dispatch_and_evaluation_operations(
     monkeypatch.setattr(
         database,
         "list_evaluations",
-        lambda: [{"run_id": "eval-1", "status": "running"}],
+        lambda: [
+            {
+                "run_id": "eval-1",
+                "status": "running",
+                "claims": [
+                    {
+                        "handler_decision": "approve",
+                        "handler_payout": 10.0,
+                        "decision": None,
+                        "seconds": 0.0,
+                    }
+                ],
+                "model_cost": 0.0,
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "finished_at": None,
+            }
+        ],
     )
     monkeypatch.setattr(database, "get_evaluation", lambda run_id: None)
 

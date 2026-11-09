@@ -216,6 +216,31 @@ def create_dispatch(
     return response.json()
 
 
+def create_evaluation(  # noqa: PLR0913, PLR0917
+    run_id: str,
+    evaluation_set: Literal["evaluation", "held_out"],
+    tiny: bool,
+    agents: int,
+    model: str,
+    reasoning_effort: str,
+) -> dict[str, Any]:
+    """Create an evaluation with its labelled claim copies through the backend."""
+    with backend() as client:
+        response = client.post(
+            "/api/runs/evaluations",
+            json={
+                "run_id": run_id,
+                "evaluation_set": evaluation_set,
+                "tiny": tiny,
+                "agents": agents,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+            },
+        )
+    response.raise_for_status()
+    return response.json()
+
+
 def record_run_claims(run_id: str, claim_ids: list[str]) -> None:
     """Record the claims selected for one dispatch."""
     with backend() as client:

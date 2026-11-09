@@ -186,6 +186,43 @@ def test_dispatch_claim_work_records_model_usage_and_elapsed_time(
     assert work_times[0]["seconds"] >= 0
 
 
+def test_evaluation_claim_waiting_for_signoff_clears_its_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    states = iter(
+        [
+            {
+                "status": "in progress",
+                "thread_id": None,
+                "decision": None,
+                "evaluation_id": "evaluation-1",
+            },
+            {
+                "status": "waiting for sign-off",
+                "thread_id": "evaluation-thread",
+                "decision": {"outcome": "approve"},
+                "evaluation_id": "evaluation-1",
+            },
+        ]
+    )
+    cleared: list[str] = []
+
+    class Saver:
+        def delete_thread(self, thread_id: str) -> None:
+            cleared.append(thread_id)
+
+    class Graph:
+        checkpointer = Saver()
+
+    monkeypatch.setattr(harness.api, "get_agent_claim", lambda claim_id: next(states))
+    monkeypatch.setattr(harness, "work_claim", lambda *args: "held for sign-off")
+
+    report = harness.work_in_run("CLM-1104-E1", "evaluation-1", Graph)
+
+    assert report == "held for sign-off"
+    assert cleared == ["evaluation-thread"]
+
+
 def test_sign_off_resumes_the_saved_graph_and_pays_once(backend_client: TestClient):
     database.set_claim_status("CLM-1003", "in progress")
     saver = InMemorySaver()

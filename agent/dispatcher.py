@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import operator
 from collections.abc import Callable
 from typing import Annotated, Any, NotRequired, TypedDict
@@ -7,9 +8,16 @@ from typing import Annotated, Any, NotRequired, TypedDict
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
-from langgraph.types import Send
+from langgraph.types import RetryPolicy, Send
 
-from agent import api
+from agent import api, harness
+
+logger = logging.getLogger(__name__)
+RETRY = RetryPolicy(
+    max_attempts=3,
+    initial_interval=10,
+    retry_on=harness.TRANSIENT,
+)
 
 
 class Dispatch(TypedDict):
@@ -48,7 +56,29 @@ def work_claim(state: Dispatch, runtime: Runtime[DispatchContext]) -> dict[str, 
     if claim_id is None:
         raise ValueError("A dispatched claim task must include claim_id")
     run_id = runtime.context["run"]["run_id"]
-    report = runtime.context["work"](claim_id, run_id)
+    try:
+        report = runtime.context["work"](claim_id, run_id)
+    except harness.TRANSIENT as error:
+        execution_info = runtime.execution_info
+        if (
+            execution_info is not None
+            and execution_info.node_attempt < RETRY.max_attempts
+        ):
+            raise
+        logger.exception("Claim %s exhausted transient retries", claim_id)
+        report = (
+            f"{claim_id}  left for the next dispatch: {type(error).__name__}: {error}"
+        )
+    except Exception:
+        logger.exception("Claim %s failed; retrying once", claim_id)
+        try:
+            report = runtime.context["work"](claim_id, run_id)
+        except Exception as retry_error:
+            logger.exception("Claim %s failed its in-dispatch retry", claim_id)
+            report = (
+                f"{claim_id}  left for the next dispatch: "
+                f"{type(retry_error).__name__}: {retry_error}"
+            )
     return {"reports": [report]}
 
 
@@ -62,7 +92,7 @@ def build_graph() -> Any:
     """Build the fan-out graph; execution concurrency is set per run."""
     builder = StateGraph(Dispatch, context_schema=DispatchContext)
     builder.add_node("list_claims", list_claims)
-    builder.add_node("work_claim", work_claim)
+    builder.add_node("work_claim", work_claim, retry_policy=RETRY)
     builder.add_node("finish_run", finish_run)
     builder.add_edge(START, "list_claims")
     builder.add_conditional_edges(

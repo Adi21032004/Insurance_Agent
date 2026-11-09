@@ -4,7 +4,7 @@ import logging
 import os
 import threading
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
@@ -28,7 +28,7 @@ class DispatchRequest(BaseModel):
 
 
 class EvaluationRequest(BaseModel):
-    evaluation_set: str = Field(min_length=1)
+    evaluation_set: Literal["evaluation", "held_out"]
     tiny: bool
     agents: int = Field(ge=1, le=25)
 
@@ -105,6 +105,52 @@ def dispatch_in_background(agents: int, saver: Any) -> None:
         app.state.run_lock.release()
 
 
+def evaluation_in_background(
+    evaluation_set: Literal["evaluation", "held_out"],
+    tiny: bool,
+    agents: int,
+    saver: Any,
+) -> None:
+    """Create and execute an evaluation on backend-owned labelled copies."""
+    run_id: str | None = None
+    try:
+        model_name = os.getenv("MODEL_NAME") or "openai/gpt-6-luna"
+        reasoning_effort = "none" if os.getenv("MODEL_NAME") else "low"
+        run = api.create_evaluation(
+            str(uuid4()),
+            evaluation_set,
+            tiny,
+            agents,
+            model_name,
+            reasoning_effort,
+        )
+        run_id = run.get("run_id")
+        claim_ids = run.get("claim_ids")
+        if not isinstance(run_id, str) or not isinstance(claim_ids, list):
+            raise RuntimeError(
+                "The backend did not return an evaluation and its claims"
+            )
+        run.update({"agents": agents, "claim_ids": claim_ids})
+        reports = dispatcher.work_run(
+            run,
+            lambda claim_id, active_run_id: work_in_run(
+                claim_id,
+                active_run_id,
+                lambda: build_claim_graph(model(claim_id), saver),
+            ),
+        )
+        logger.info("Evaluation %s finished: %s", run_id, reports)
+    except Exception:
+        logger.exception("Evaluation failed")
+        if run_id is not None:
+            try:
+                api.stop_runs()
+            except Exception:
+                logger.exception("Could not stop failed evaluation %s", run_id)
+    finally:
+        app.state.run_lock.release()
+
+
 @app.get("/api/health", operation_id="health")
 def health() -> dict[str, str]:
     """Check that the agent service is running."""
@@ -135,9 +181,12 @@ def start_evaluation(
         raise HTTPException(
             status_code=409, detail="A dispatch or an evaluation is already running"
         )
-    app.state.run_lock.release()
-    raise HTTPException(
-        status_code=501, detail="Evaluation dispatch is not implemented yet"
+    background_tasks.add_task(
+        evaluation_in_background,
+        request.evaluation_set,
+        request.tiny,
+        request.agents,
+        app.state.checkpointer,
     )
     return {
         "status": "accepted",
